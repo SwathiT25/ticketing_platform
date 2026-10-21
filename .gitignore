@@ -18,3 +18,7 @@ Thumbs.db
 
 # Database dumps (contain user data; share privately, never commit)
 *.sql
+
+# Database backups (contain user data)
+backups/
+*.backup

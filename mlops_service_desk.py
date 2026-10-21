@@ -41,7 +41,7 @@ PORT = int(os.environ.get("PORT") or 8000)
 ROLES = ["user", "engineer", "admin"]
 STAT = ["NEW", "ASSIGNED", "IN PROGRESS", "ON HOLD", "CLOSED"]
 ACTIVE = ["ASSIGNED", "IN PROGRESS", "ON HOLD"]
-TYPES = ["Deployment Request", "PR Review", "Access Request", "Bug Fix", "Other"]
+TYPES = ["Deployment Request", "Access Request", "Bug Fix", "Other"]
 PRIOS = ["LOW", "MEDIUM", "HIGH", "CRITICAL"]
 ENVS = ["Development", "Staging", "Production"]
 DEPLOY_STATUSES = ["Successful", "Partially Successful", "Failed", "Rolled Back"]
@@ -49,6 +49,7 @@ ACCESS_TYPES = ["Server (SSH)", "Git Repository", "Database", "AWS / Cloud Conso
 ACCESS_LEVELS = ["Read only", "Read & Write", "Admin"]
 ACCESS_STATUSES = ["Access Granted", "Partially Granted", "Rejected"]
 EMAIL_RE = re.compile(r"^[^@\s,;]+@[^@\s,;]+\.[^@\s,;]+$")
+BRANCH_RE = re.compile(r"^[\w][\w./-]{0,199}$")  # Git branch names: letters, digits, _ . / - and no spaces
 URL_RE = re.compile(r"^https?://\S+$")
 
 def fmt(d): return d.astimezone().strftime("%b %d, %Y %I:%M %p")
@@ -100,6 +101,7 @@ create table if not exists ticket_images(
   id serial primary key, ticket_id int not null references tickets(id) on delete cascade, name text not null,
   mime text not null, data bytea not null, created_at timestamptz not null default now());
 alter table otps add column if not exists attempts int not null default 0;  -- wrong guesses; the code stops working after 5
+alter table tickets add column if not exists branch text not null default '';  -- Git branch to deploy (Deployment Request)
 alter table tickets add column if not exists access jsonb;  -- Access Request details: type, resource, level, for, until
 create index if not exists ix_tickets_status on tickets(status);
 create index if not exists ix_images_ticket on ticket_images(ticket_id);
@@ -228,7 +230,7 @@ class PwIn(BaseModel): ticket: str; password: str
 class LoginIn(BaseModel): email: str; password: str
 class ReqIn(BaseModel):
     title: str; description: str; type: str = "Deployment Request"; priority: str = "MEDIUM"
-    env: str = "Production"; repo: str = ""; pr_url: str = ""; images: list[dict] = []  # images: [{name, data: "data:image/png;base64,..."}]
+    env: str = "Production"; repo: str = ""; branch: str = ""; pr_url: str = ""; images: list[dict] = []  # images: [{name, data: "data:image/png;base64,..."}]
     access: dict = {}  # Access Request only: {type, resource, level, for, until}
 class CmtIn(BaseModel): body: str
 class AsgIn(BaseModel): email: str; cc: str = ""
@@ -325,7 +327,8 @@ def link(rid): return f"{APP_URL}/#/t/{rid}"
 def ticket_text(t):
     a = t.get("access")
     extra = (f"Access To: {a['type']}\nServer / System: {a['resource']}\nAccess Level: {a['level']}\nAccess For: {a['for']}\n"
-             f"Needed Until: {a['until'] or 'Permanent'}\n") if a else "" if t["type"] == "Other" else f"Repository: {t['repo'] or '-'}\nPull Request: {t['pr_url'] or '-'}\n"
+             f"Needed Until: {a['until'] or 'Permanent'}\n") if a else "" if t["type"] == "Other" else (
+                 f"Repository: {t['repo'] or '-'}\n" + (f"Branch: {t['branch']}\n" if t["branch"] else "") + f"Pull Request: {t['pr_url'] or '-'}\n")
     return (f"Ticket: {t['rid']}\nTitle: {t['title']}\nType: {t['type']}\nPriority: {t['priority']}\nEnvironment: {t['env']}\n"
             f"{extra}Raised by: {t['rname']} <{t['remail']}>\n"
             f"Created: {t['created_at']}\n\nDescription:\n{t['description']}\n\nOpen ticket: {link(t['rid'])}")
@@ -447,7 +450,7 @@ def parse_access(a, u):
 
 @app.post("/api/requests")
 def create(b: ReqIn, u=Depends(user)):
-    title, desc, repo, pr = b.title.strip(), b.description.strip(), b.repo.strip(), b.pr_url.strip()
+    title, desc, repo, pr, branch = b.title.strip(), b.description.strip(), b.repo.strip(), b.pr_url.strip(), b.branch.strip()
     if not title or not desc: raise HTTPException(400, "Title and description are required")
     if len(title) > 200: raise HTTPException(400, "Title must be 200 characters or fewer")
     if b.type not in TYPES or b.priority not in PRIOS or b.env not in ENVS: raise HTTPException(400, "Invalid type, priority or environment")
@@ -458,13 +461,17 @@ def create(b: ReqIn, u=Depends(user)):
         repo, pr = "", ""  # general requests have no repository or pull request
     else:
         if not repo: raise HTTPException(400, "Repository is required")
-        if b.type == "PR Review" and not pr: raise HTTPException(400, "Pull Request URL is required for a PR Review")
         if pr and not URL_RE.match(pr): raise HTTPException(400, "Pull Request URL must start with http:// or https://")
+    if b.type == "Deployment Request":
+        if not branch: raise HTTPException(400, "Branch name is required for a Deployment Request")
+        if not BRANCH_RE.match(branch): raise HTTPException(400, "Branch name can only use letters, numbers and _ . / - (no spaces)")
+    else:
+        branch = ""
     images = parse_images(b.images) if b.type in SHOT_TYPES else []
     with tx() as c:
-        t = c.execute("""insert into tickets(title,description,type,priority,env,repo,pr_url,access,requester_id)
-                         values(%s,%s,%s,%s,%s,%s,%s,%s,%s) returning id, rid""",
-                      (title, desc, b.type, b.priority, b.env, repo, pr, Jsonb(access) if access else None, u["id"])).fetchone()
+        t = c.execute("""insert into tickets(title,description,type,priority,env,repo,branch,pr_url,access,requester_id)
+                         values(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) returning id, rid""",
+                      (title, desc, b.type, b.priority, b.env, repo, branch, pr, Jsonb(access) if access else None, u["id"])).fetchone()
         for name, mime, data in images:
             c.execute("insert into ticket_images(ticket_id,name,mime,data) values(%s,%s,%s,%s)", (t["id"], name, mime, data))
         hist(c, t["id"], "CREATED", u["id"], f"Created by {u['name']} <{u['email']}>"
@@ -756,7 +763,7 @@ const STAT=["NEW","ASSIGNED","IN PROGRESS","ON HOLD","CLOSED"],TRACK=["NEW","ASS
 const DESC={"NEW":"Waiting for assignment","ASSIGNED":"Owner assigned","IN PROGRESS":"Work in progress","ON HOLD":"Paused by the owner","CLOSED":"Resolved and closed"};
 const ROLES=["user","engineer","admin"],ROLE_NAME={user:'User',engineer:'ML Engineer',admin:'Admin'};
 const ACTION={CREATED:'Created',ASSIGNED:'Assigned',REASSIGNED:'Reassigned',OWNERSHIP_TAKEN:'Ownership taken',STATUS_CHANGED:'Status changed',COMMENTED:'Comment',CLOSED:'Closed'};
-const TYPES=["Deployment Request","PR Review","Access Request","Bug Fix","Other"],PRIOS=["LOW","MEDIUM","HIGH","CRITICAL"],ENVS=["Development","Staging","Production"];
+const TYPES=["Deployment Request","Access Request","Bug Fix","Other"],PRIOS=["LOW","MEDIUM","HIGH","CRITICAL"],ENVS=["Development","Staging","Production"];
 const DEPLOY=["Successful","Partially Successful","Failed","Rolled Back"],ACCESS_STAT=["Access Granted","Partially Granted","Rejected"];
 const ACCESS_LEVELS=["Read only","Read & Write","Admin"];
 // What to ask for in the "server / system" box, per kind of access
@@ -839,7 +846,7 @@ const CardHead=({title,children})=><div className="chead"><h3>{title}</h3>{child
 /* ---------- Auth screens ---------- */
 function AuthShell({children}){
   return <div className="authwrap"><div className="hero"><div className="logo">⚙</div><h1>MLOps Service Desk</h1>
-    <p>Raise, track and close deployment, review and access requests in one place.</p>
+    <p>Raise, track and close deployment, access and bug-fix requests in one place.</p>
     <ul>{['Secure email OTP sign-up','Admin assigns or takes ownership of tickets','Email notifications at every step','Full audit trail for every ticket'].map(t=><li key={t}><span><Ic n="check" s={14}/></span>{t}</li>)}</ul></div>
     <div className="formside"><div className="formcard">{children}</div></div></div>;
 }
@@ -961,7 +968,7 @@ function AdminDash({me,go}){
       {!d.recent.length&&<div className="empty">No activity yet.</div>}</div></div>;
 }
 function Raise({go,flash}){
-  const [f,setF]=useState({title:'',description:'',type:TYPES[0],priority:'HIGH',env:'Production',repo:'',pr_url:''}),[busy,setBusy]=useState(false);
+  const [f,setF]=useState({title:'',description:'',type:TYPES[0],priority:'HIGH',env:'Production',repo:'',branch:'',pr_url:''}),[busy,setBusy]=useState(false);
   const [imgs,setImgs]=useState([]),[ac,setAc]=useState({type:'Server (SSH)',resource:'',level:'Read only',for:'',until:''});
   const u=k=>e=>setF({...f,[k]:e.target.value}),ua=k=>e=>setAc({...ac,[k]:e.target.value});
   const isAcc=f.type==='Access Request',isOther=f.type==='Other',shots=f.type==='Bug Fix'||isOther,[resLabel,resHint]=ACCESS_TYPES[ac.type];
@@ -985,7 +992,10 @@ function Raise({go,flash}){
       <div className="row2"><label>Access Level<select value={ac.level} onChange={ua('level')}>{ACCESS_LEVELS.map(t=><option key={t}>{t}</option>)}</select></label>
       <F l="Needed Until (leave blank if permanent)" type="date" min={nowLocal().slice(0,10)} value={ac.until} onChange={ua('until')}/></div>
       <F l="Access For (leave blank if it is for you)" value={ac.for} onChange={ua('for')} placeholder="janani.n@iitmpravartak.net, baskar@iitmpravartak.net"/></>
-    :!isOther&&<F l={f.type==='PR Review'?'Pull Request URL':'Pull Request URL (optional)'} type="url" required={f.type==='PR Review'} value={f.pr_url} onChange={u('pr_url')} placeholder="https://github.com/.../pull/245"/>}
+    :!isOther&&<>
+      {f.type==='Deployment Request'&&<F l="Branch Name" required value={f.branch} onChange={u('branch')} placeholder="release/v2.4" maxLength="200"
+        pattern="[\w][\w.\/\-]*" title="Letters, numbers and _ . / - only (no spaces)"/>}
+      <F l="Pull Request URL (optional)" type="url" value={f.pr_url} onChange={u('pr_url')} placeholder="https://github.com/.../pull/245"/></>}
     {shots&&<><label>Screenshots (optional, up to 5 images, 5 MB each)
       <input type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple onChange={addImgs}/></label>
       {imgs.length>0&&<div className="shots">{imgs.map((x,i)=><div key={i} className="shot"><img src={x.data} alt={x.name}/>
@@ -1136,7 +1146,7 @@ function Detail({id,me,flash,refresh}){
       <Row k="Requester">{`${r.rname} <${r.remail}>`}</Row><Row k="Type">{r.type}</Row><Row k="Priority"><Badge v={r.priority}/></Row><Row k="Environment">{r.env}</Row>
       {r.access?<><Row k="Access To">{r.access.type}</Row><Row k={ACCESS_TYPES[r.access.type]?.[0]||'Server / System'}><b>{r.access.resource}</b></Row>
         <Row k="Access Level">{r.access.level}</Row><Row k="Access For">{r.access.for.split(',').join(', ')}</Row><Row k="Needed Until">{r.access.until||'Permanent'}</Row></>
-      :r.type!=='Other'&&<><Row k="Repository">{r.repo||'-'}</Row><Row k="Pull Request"><Url u={r.pr_url}/></Row></>}
+      :r.type!=='Other'&&<><Row k="Repository">{r.repo||'-'}</Row>{r.branch?<Row k="Branch"><b>{r.branch}</b></Row>:null}<Row k="Pull Request"><Url u={r.pr_url}/></Row></>}
       <Row k="Owner">{owner(r)}</Row><Row k="Ownership">{ownership(r)}{r.assigned_at?` on ${r.assigned_at}`:''}</Row>
       {r.cc?<Row k="Also Notified">{r.cc.split(',').join(', ')}</Row>:null}
       {r.status==='CLOSED'?<Row k="Closed By"><b>{`${r.closed_by_name} <${r.closed_by_email}>`}</b>{` on ${r.closed_at}`}</Row>:null}
@@ -1281,4 +1291,6 @@ if __name__ == "__main__":
                   f"Open http://127.0.0.1:{PORT} to use it, or stop it first with:\n"
                   f"  Get-NetTCPConnection -LocalPort {PORT} -State Listen | ForEach-Object {{ Stop-Process -Id $_.OwningProcess -Force }}\n")
             sys.exit(1)
+    # Uvicorn prints http://0.0.0.0:PORT, which browsers can't open; show the addresses people should use
+    print(f"\n  Open on this PC:        http://127.0.0.1:{PORT}" + (f"\n  Open from other PCs:    {APP_URL}" if HOST != "127.0.0.1" else "") + "\n", flush=True)
     uvicorn.run(app, host=HOST, port=PORT)

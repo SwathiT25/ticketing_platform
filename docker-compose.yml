@@ -1,3 +1,9 @@
+# MLOps Service Desk: the app and its PostgreSQL database.
+#   Start / update:  docker compose up -d --build
+#   Logs:            docker compose logs -f app
+#   Stop:            docker compose down          (data is kept in the servicedesk_pgdata volume)
+# Settings and passwords come from .env (copy .env.example). The explicit project name keeps this
+# separate from any other compose project in a folder with the same name.
 name: mlops-servicedesk
 services:
   postgres:
@@ -9,7 +15,7 @@ services:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
     ports:
-      - "127.0.0.1:5449:5432"
+      - "127.0.0.1:5449:5432"   # only this machine can reach the database (5434 is taken on titan)
     volumes:
       - servicedesk_pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -20,15 +26,18 @@ services:
 
   app:
     build: .
+    image: mlops-servicedesk:latest
     container_name: ticketing-platform-app
     restart: unless-stopped
     env_file: .env
     environment:
-      HOST: 0.0.0.0
-      PORT: 8000
+      # Inside Docker the app reaches PostgreSQL by its service name, not the host port
       DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      HOST: 0.0.0.0
+      PORT: "8000"
+      TZ: ${TZ:-Asia/Kolkata}
     ports:
-      - "8000:8000"
+      - "${APP_PORT:-8000}:8000"
     depends_on:
       postgres:
         condition: service_healthy
