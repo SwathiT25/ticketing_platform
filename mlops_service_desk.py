@@ -1,10 +1,15 @@
 # mlops_service_desk.py  |  MLOps Service Desk: FastAPI + PostgreSQL backend with a React frontend, in one file.
 # Setup:  docker compose up -d   |   pip install -r requirements.txt   |   python mlops_service_desk.py   |   open http://127.0.0.1:8000
-# Config (.env or environment): DATABASE_URL, SECRET_KEY, APP_URL, ADMIN_EMAIL, ADMIN_PASSWORD, SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_FROM.
-# Admin (auto-created on first run): admin@example.com / Admin@123 unless ADMIN_EMAIL / ADMIN_PASSWORD are set.
+# Config (.env or environment): DATABASE_URL, SECRET_KEY, APP_URL, ADMIN_EMAILS, ADMIN_PASSWORD, SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_FROM.
+# Admins: every address in ADMIN_EMAILS (or ADMIN_EMAIL) is made an admin on each start; missing accounts are created
+# with ADMIN_PASSWORD (or without a password, to activate with "Create account"). Existing passwords are never reset.
 # Roles: user (raises tickets), engineer (works tickets assigned to them), admin (assigns, takes ownership, manages roles).
 # Only a ticket's owner (its assignee) can start, hold, resume and close it. Every action is written to ticket_history.
+# Deployments end as "Successfully Deployed" (closes the ticket) or "Failed / Bug Fix Required": the owner or an admin
+# describes the bugs with screenshots, the ticket waits ON HOLD for the fix, and the requester (or the owner or an admin)
+# resubmits it for redeployment, which sends it back to the owner.
 # Tools:  python mlops_service_desk.py --test-email you@example.com   |   python mlops_service_desk.py --import-sqlite servicedesk.db
+#         python mlops_service_desk.py --ensure-admins   (repairs admin roles from ADMIN_EMAILS without starting the server)
 # The React frontend loads React + Babel from cdnjs, so the browser needs internet access.
 import os, re, sys, json, hmac, hashlib, base64, time, smtplib, secrets, logging
 from concurrent.futures import ThreadPoolExecutor
@@ -13,7 +18,7 @@ from datetime import datetime
 from email.message import EmailMessage
 from typing import Optional
 from fastapi import FastAPI, HTTPException, Depends, Header, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from pydantic import BaseModel
 import psycopg
 from psycopg.rows import dict_row
@@ -41,16 +46,17 @@ PORT = int(os.environ.get("PORT") or 8000)
 ROLES = ["user", "engineer", "admin"]
 STAT = ["NEW", "ASSIGNED", "IN PROGRESS", "ON HOLD", "CLOSED"]
 ACTIVE = ["ASSIGNED", "IN PROGRESS", "ON HOLD"]
-TYPES = ["Deployment Request", "Access Request", "Bug Fix", "Other"]
+TYPES = ["Deployment Request", "Access Request", "Other"]
 PRIOS = ["LOW", "MEDIUM", "HIGH", "CRITICAL"]
 ENVS = ["Development", "Staging", "Production"]
-DEPLOY_STATUSES = ["Successful", "Partially Successful", "Failed", "Rolled Back"]
-ACCESS_TYPES = ["Server (SSH)", "Git Repository", "Database", "AWS / Cloud Console", "Kubernetes Cluster", "VPN", "Monitoring (Grafana)", "Other"]
+DEPLOY_STATUSES = ["Successfully Deployed"]  # failures go through /fail instead of closing the ticket
+ACCESS_TYPES = ["Git Repository", "Model Endpoint", "VPN"]
 ACCESS_LEVELS = ["Read only", "Read & Write", "Admin"]
 ACCESS_STATUSES = ["Access Granted", "Partially Granted", "Rejected"]
 EMAIL_RE = re.compile(r"^[^@\s,;]+@[^@\s,;]+\.[^@\s,;]+$")
 BRANCH_RE = re.compile(r"^[\w][\w./-]{0,199}$")  # Git branch names: letters, digits, _ . / - and no spaces
 URL_RE = re.compile(r"^https?://\S+$")
+DELETED_DOMAIN = "removed.invalid"  # deleted accounts with ticket history get deleted-<id>@removed.invalid; never emailed
 
 def fmt(d): return d.astimezone().strftime("%b %d, %Y %I:%M %p")
 def clean_email(e):
@@ -103,8 +109,22 @@ create table if not exists ticket_images(
 alter table otps add column if not exists attempts int not null default 0;  -- wrong guesses; the code stops working after 5
 alter table tickets add column if not exists branch text not null default '';  -- Git branch to deploy (Deployment Request)
 alter table tickets add column if not exists access jsonb;  -- Access Request details: type, resource, level, for, until
+create table if not exists ticket_files(  -- PDFs the owner attaches when closing an access request (VPN config, setup guide)
+  id serial primary key, ticket_id int not null references tickets(id) on delete cascade, name text not null,
+  data bytea not null, created_at timestamptz not null default now());
+alter table ticket_resolutions add column if not exists vpn_user text not null default '';  -- VPN access only
+alter table ticket_resolutions add column if not exists vpn_password text not null default '';
+alter table ticket_resolutions add column if not exists api_key text not null default '';  -- Model Endpoint access only
+create table if not exists deploy_bugs(  -- a failed deployment's bug report and, once fixed, what was fixed
+  id serial primary key, ticket_id int not null references tickets(id) on delete cascade, description text not null,
+  reported_by int not null references users(id), reported_at timestamptz not null default now(),
+  fix_notes text not null default '', fixed_by int references users(id), fixed_at timestamptz);
+alter table ticket_images add column if not exists bug_id int references deploy_bugs(id) on delete cascade;  -- screenshot of a failed deployment
+create index if not exists ix_deploy_bugs_ticket on deploy_bugs(ticket_id);
+alter table users add column if not exists deleted_at timestamptz;  -- set when an admin deletes an account that still has ticket history
 create index if not exists ix_tickets_status on tickets(status);
 create index if not exists ix_images_ticket on ticket_images(ticket_id);
+create index if not exists ix_files_ticket on ticket_files(ticket_id);
 create index if not exists ix_tickets_requester on tickets(requester_id);
 create index if not exists ix_tickets_assignee on tickets(assignee_id);
 create index if not exists ix_history_ticket on ticket_history(ticket_id);
@@ -127,6 +147,7 @@ def tx():
     with pool.connection() as c:
         with c.transaction():
             yield c
+DEFAULT_ADMIN_PW = "Admin@123"  # only used to warn when an admin still has this well-known password
 def hash_pw(p):
     s = secrets.token_hex(8); return s + "$" + hashlib.pbkdf2_hmac("sha256", p.encode(), s.encode(), 100000).hex()
 def check_pw(p, h):
@@ -139,12 +160,42 @@ def start_db():
         raise RuntimeError("PostgreSQL is not reachable") from None
     with tx() as c:
         c.execute(SCHEMA)
-        if not c.execute("select 1 from users where role='admin'").fetchone():
-            e = os.environ.get("ADMIN_EMAIL", "admin@example.com").lower()
-            c.execute("""insert into users(name,email,pw_hash,role) values(%s,%s,%s,'admin')
-                         on conflict (email) do update set role='admin', updated_at=now()""",
-                      ("MLOps Admin", e, hash_pw(os.environ.get("ADMIN_PASSWORD", "Admin@123"))))
+        admins = ensure_admins(c)
     log.info("Connected to PostgreSQL at %s", safe_url(DATABASE_URL))
+    return admins
+
+def configured_admin_emails():
+    # ADMIN_EMAILS (comma-separated) plus the older single ADMIN_EMAIL, trimmed, lowercased, de-duplicated
+    raw = re.split(r"[,;\s]+", f"{os.environ.get('ADMIN_EMAILS', '')},{os.environ.get('ADMIN_EMAIL', '')}")
+    out = []
+    for e in (x.strip().lower() for x in raw if x.strip()):
+        if not EMAIL_RE.match(e): log.error("Ignoring invalid admin email in ADMIN_EMAILS/ADMIN_EMAIL: %r", e)
+        elif e not in out: out.append(e)
+    return out
+def ensure_admins(c):
+    # Runs on every start (and with --ensure-admins). Every configured email ends up as an admin:
+    # existing accounts are promoted, missing ones are created. Existing passwords are never changed,
+    # and admins who are not listed are left alone.
+    pw = os.environ.get("ADMIN_PASSWORD", "")
+    for e in configured_admin_emails():
+        x = c.execute("select id, role from users where email=%s for update", (e,)).fetchone()
+        if not x:
+            # Without ADMIN_PASSWORD the account is created without a password; the owner activates it
+            # with "Create account" (a code is emailed to that address) and keeps the admin role.
+            c.execute("insert into users(name,email,pw_hash,role) values(%s,%s,%s,'admin')", (name_from(e), e, hash_pw(pw) if pw else None))
+            audit(c, None, "ADMIN_CREATED", e, "Created from ADMIN_EMAILS" + ("" if pw else " without a password; activate with Create account"))
+            log.info("Created admin account %s%s", e, "" if pw else " (no password yet: activate it with 'Create account')")
+        elif x["role"] != "admin":
+            c.execute("update users set role='admin', updated_at=now() where id=%s", (x["id"],))
+            audit(c, None, "ROLE_CHANGED", e, f"{x['role']} -> admin (listed in ADMIN_EMAILS)")
+            log.info("Promoted %s from %s to admin (listed in ADMIN_EMAILS)", e, x["role"])
+    admins = c.execute("select email, pw_hash from users where role='admin' order by id").fetchall()
+    if not admins:
+        log.error("There is no admin account. Set ADMIN_EMAILS in .env and restart, or run: python mlops_service_desk.py --ensure-admins")
+    for a in admins:
+        if a["pw_hash"] and check_pw(DEFAULT_ADMIN_PW, a["pw_hash"]):
+            log.warning("Admin %s still uses the default password %s. Change it now (Settings > Change Password in the app).", a["email"], DEFAULT_ADMIN_PW)
+    return [a["email"] for a in admins]
 
 @asynccontextmanager
 async def lifespan(app):
@@ -203,6 +254,7 @@ mailer = ThreadPoolExecutor(max_workers=4, thread_name_prefix="mail")
 def notify(email, ticket_id, msg, subject, wait=False):
     # In-app notification when the address has an account, plus an email either way.
     # Emails go out in the background so a button press doesn't wait on the mail server; wait=True returns the send error.
+    if email.endswith("@" + DELETED_DOMAIN): return None
     x = q("select id from users where email=%s", (email,), True)
     if x: run("insert into notifications(user_id,ticket_id,message) values(%s,%s,%s)", (x["id"], ticket_id, msg))
     if wait: return mail(email, subject, msg)
@@ -227,11 +279,14 @@ class RegIn(BaseModel): name: str; email: str
 class EmailIn(BaseModel): email: str
 class VerIn(BaseModel): email: str; code: str
 class PwIn(BaseModel): ticket: str; password: str
+class ChangePwIn(BaseModel): current: str; password: str
 class LoginIn(BaseModel): email: str; password: str
 class ReqIn(BaseModel):
     title: str; description: str; type: str = "Deployment Request"; priority: str = "MEDIUM"
     env: str = "Production"; repo: str = ""; branch: str = ""; pr_url: str = ""; images: list[dict] = []  # images: [{name, data: "data:image/png;base64,..."}]
     access: dict = {}  # Access Request only: {type, resource, level, for, until}
+class FailIn(BaseModel): description: str; images: list[dict] = []
+class ResubmitIn(BaseModel): fix_notes: str; branch: str = ""; pr_url: str = ""
 class CmtIn(BaseModel): body: str
 class AsgIn(BaseModel): email: str; cc: str = ""
 class HoldIn(BaseModel): reason: str
@@ -239,6 +294,7 @@ class RoleIn(BaseModel): role: str
 class CloseIn(BaseModel):
     deploy_status: str; deployed_at: str; notes: str; issues: str = ""; resolution: str; deploy_url: str
     version: str = ""; env: str = "Production"
+    vpn_user: str = ""; vpn_password: str = ""; api_key: str = ""; files: list[dict] = []  # files: PDFs [{name, data: "data:application/pdf;base64,..."}]
 
 # ---------------- Auth routes ----------------
 @app.post("/api/auth/register")
@@ -290,6 +346,14 @@ def login(b: LoginIn):
     if u and not u["pw_hash"]: raise HTTPException(400, "This account isn't activated yet. Use 'Create account' with this email to set a password.")
     if not u or not check_pw(b.password, u["pw_hash"]): raise HTTPException(400, "Invalid email or password")
     return {"token": sign({"p": "auth", "uid": u["id"]}, 7 * 86400)}
+@app.post("/api/auth/change-password")
+def change_password(b: ChangePwIn, u=Depends(user)):
+    # Signed-in users change their own password; works for accounts without a real mailbox (e.g. admin@example.com)
+    if not check_pw(b.current, u["pw_hash"]): raise HTTPException(400, "Current password is wrong")
+    if len(b.password) < 8: raise HTTPException(400, "New password must be at least 8 characters")
+    if b.password == b.current: raise HTTPException(400, "New password must be different from the current one")
+    run("update users set pw_hash=%s, updated_at=now() where id=%s", (hash_pw(b.password), u["id"]))
+    return {"ok": True}
 @app.get("/api/me")
 def me(u=Depends(user)):
     n = q("select count(*) c from notifications where user_id=%s and not seen", (u["id"],), True)["c"]
@@ -300,12 +364,15 @@ def me(u=Depends(user)):
 # ---------------- Tickets: helpers ----------------
 SEL = """select t.*, r.name rname, r.email remail, a.name aname, a.email aemail, ab.name assigned_by_name,
     res.deploy_status, res.deployed_at, res.notes deploy_notes, res.issues, res.resolution, res.deploy_url, res.version,
-    res.environment res_env, res.closed_at, cb.name closed_by_name, cb.email closed_by_email
+    res.environment res_env, res.closed_at, cb.name closed_by_name, cb.email closed_by_email,
+    exists(select 1 from deploy_bugs db where db.ticket_id=t.id and db.fixed_at is null) fix_open
   from tickets t join users r on r.id=t.requester_id left join users a on a.id=t.assignee_id
   left join users ab on ab.id=t.assigned_by left join ticket_resolutions res on res.ticket_id=t.id
   left join users cb on cb.id=res.closed_by"""
 def fetch(rid): return q(SEL + " where t.rid=%s", (rid,), True)
-def can_view(t, u): return u["role"] == "admin" or t["requester_id"] == u["id"] or t["assignee_id"] == u["id"]
+def can_view(t, u):
+    return (u["role"] == "admin" or t["requester_id"] == u["id"] or t["assignee_id"] == u["id"]
+            or u["email"] in (t["access"] or {}).get("for", "").split(","))  # the people an access request is for
 def get_ticket(rid, u):
     t = fetch(rid)
     if not t or not can_view(t, u): raise HTTPException(404, "Ticket not found")
@@ -326,8 +393,7 @@ def audit(c, actor_id, action, target, detail=""):
 def link(rid): return f"{APP_URL}/#/t/{rid}"
 def ticket_text(t):
     a = t.get("access")
-    extra = (f"Access To: {a['type']}\nServer / System: {a['resource']}\nAccess Level: {a['level']}\nAccess For: {a['for']}\n"
-             f"Needed Until: {a['until'] or 'Permanent'}\n") if a else "" if t["type"] == "Other" else (
+    extra = (f"Access To: {a['type']}\n" + (f"Server / System: {a['resource']}\n" if a["resource"] else "") + (f"Access Level: {a['level']}\n" if a["level"] else "")) if a else "" if t["type"] == "Other" else (
                  f"Repository: {t['repo'] or '-'}\n" + (f"Branch: {t['branch']}\n" if t["branch"] else "") + f"Pull Request: {t['pr_url'] or '-'}\n")
     return (f"Ticket: {t['rid']}\nTitle: {t['title']}\nType: {t['type']}\nPriority: {t['priority']}\nEnvironment: {t['env']}\n"
             f"{extra}Raised by: {t['rname']} <{t['remail']}>\n"
@@ -342,17 +408,19 @@ def listing(where, a, s):
     rows = q(f"{SEL} where {where} and t.status=%s order by t.id desc", [*a, s]) if s in STAT else q(f"{SEL} where {where} order by t.id desc", a)
     return {"rows": rows, "counts": status_counts(where, a)}
 def count(where, a=()): return q(f"select count(*) c from tickets t where {where}", a, True)["c"]
+FIX_OPEN = "exists(select 1 from deploy_bugs db where db.ticket_id=t.id and db.fixed_at is null)"
 LAST_COMMENTER = "(select m.author_id from comments m where m.ticket_id=t.id order by m.id desc limit 1)"
 
 # ---------------- Tickets: reading ----------------
 def resolver(u=Depends(user)):
-    if u["role"] not in ("engineer", "admin"): raise HTTPException(403, "ML Engineers and admins only")
+    if u["role"] not in ("engineer", "admin"): raise HTTPException(403, "MLOps Engineers and admins only")
     return u
 @app.get("/api/dashboard")
 def dashboard(u=Depends(user)):
     uid = u["id"]
     d = {"raised": status_counts("t.requester_id=%s", (uid,)),
-         "need_reply": count(f"t.requester_id=%s and t.status<>'CLOSED' and {LAST_COMMENTER}<>%s", (uid, uid))}
+         "need_reply": count(f"t.requester_id=%s and t.status<>'CLOSED' and {LAST_COMMENTER}<>%s", (uid, uid)),
+         "fix_needed": count(f"t.requester_id=%s and {FIX_OPEN}", (uid,))}
     if u["role"] in ("engineer", "admin"):
         d["owned"] = status_counts("t.assignee_id=%s", (uid,))
         d["owned_need_reply"] = count(f"t.assignee_id=%s and t.status<>'CLOSED' and {LAST_COMMENTER}<>%s", (uid, uid))
@@ -372,12 +440,12 @@ def dashboard(u=Depends(user)):
                   count(t.id) filter (where t.status='ON HOLD') on_hold,
                   (select count(*) from ticket_resolutions r where r.closed_by=u.id) closed
                 from users u left join tickets t on t.assignee_id=u.id and t.status<>'CLOSED'
-                where u.role in ('engineer','admin') group by u.id
+                where u.role in ('engineer','admin') and u.deleted_at is null group by u.id
                 order by count(t.id) desc, u.role='admin', u.name""")
         d["recent"] = q("""select h.id, h.action, h.from_status, h.to_status, h.created_at, x.name actor, t.rid, t.title
                 from ticket_history h join tickets t on t.id=h.ticket_id left join users x on x.id=h.actor_id order by h.id desc limit 12""")
-        d["users"] = dict.fromkeys(ROLES, 0) | {x["role"]: x["c"] for x in q("select role, count(*) c from users group by role")}
-        d["users"]["invited"] = q("select count(*) c from users where pw_hash is null", (), True)["c"]
+        d["users"] = dict.fromkeys(ROLES, 0) | {x["role"]: x["c"] for x in q("select role, count(*) c from users where deleted_at is null group by role")}
+        d["users"]["invited"] = q("select count(*) c from users where pw_hash is null and deleted_at is null", (), True)["c"]
     return d
 @app.get("/api/requests")
 def my_requests(s: str = "ALL", u=Depends(user)): return listing("t.requester_id=%s", [u["id"]], s)
@@ -395,7 +463,13 @@ def detail(rid: str, u=Depends(user)):
         if h["to_status"]: ts.setdefault(h["to_status"], h["created_at"])
     cm = q("""select m.author_id, m.body, m.created_at, x.name, x.role from comments m join users x on x.id=m.author_id
               where m.ticket_id=%s order by m.id""", (t["id"],))
-    imgs = q("select id, name from ticket_images where ticket_id=%s order by id", (t["id"],))
+    imgs = q("select id, name from ticket_images where ticket_id=%s and bug_id is null order by id", (t["id"],))
+    bugs = q("""select b.id, b.description, b.reported_at, b.fix_notes, b.fixed_at, x.name reported_by_name, y.name fixed_by_name,
+                  coalesce((select json_agg(json_build_object('id', i.id, 'name', i.name) order by i.id) from ticket_images i where i.bug_id=b.id), '[]') images
+                from deploy_bugs b join users x on x.id=b.reported_by left join users y on y.id=b.fixed_by where b.ticket_id=%s order by b.id""", (t["id"],))
+    files = q("select id, name from ticket_files where ticket_id=%s order by id", (t["id"],))
+    creds = q("""select vpn_user, vpn_password, api_key from ticket_resolutions
+                 where ticket_id=%s and (vpn_user<>'' or api_key<>'')""", (t["id"],), True)
     # Exact times (epoch seconds) for the tracker's step-to-step durations, plus total time spent ON HOLD
     tse, hold, hold_from = {}, 0.0, None
     for h in q("""select from_status, to_status, extract(epoch from created_at)::float at from ticket_history
@@ -405,7 +479,7 @@ def detail(rid: str, u=Depends(user)):
         elif hold_from is not None and h["to_status"] != "ON HOLD": hold += h["at"] - hold_from; hold_from = None
     now = time.time()
     if hold_from is not None: hold += now - hold_from
-    return {**t, "history": hist_rows, "comments": cm, "images": imgs, "ts": ts, "tse": tse, "hold_secs": hold, "now": now,
+    return {**t, "history": hist_rows, "comments": cm, "images": imgs, "files": files, "creds": creds, "bugs": bugs, "ts": ts, "tse": tse, "hold_secs": hold, "now": now,
             "is_owner": t["assignee_id"] == u["id"]}
 @app.get("/api/requests/{rid}/images/{iid}")
 def image(rid: str, iid: int, u=Depends(user)):
@@ -413,9 +487,15 @@ def image(rid: str, iid: int, u=Depends(user)):
     x = q("select name, mime, data from ticket_images where id=%s and ticket_id=%s", (iid, t["id"]), True)
     if not x: raise HTTPException(404, "Image not found")
     return {"name": x["name"], "src": f"data:{x['mime']};base64," + base64.b64encode(x["data"]).decode()}
+@app.get("/api/requests/{rid}/files/{fid}")
+def pdf_file(rid: str, fid: int, u=Depends(user)):
+    t = get_ticket(rid, u)  # same access rule as the ticket itself
+    x = q("select name, data from ticket_files where id=%s and ticket_id=%s", (fid, t["id"]), True)
+    if not x: raise HTTPException(404, "File not found")
+    return {"name": x["name"], "src": "data:application/pdf;base64," + base64.b64encode(x["data"]).decode()}
 
 # ---------------- Tickets: actions ----------------
-MAX_IMAGES, MAX_IMAGE_MB, SHOT_TYPES = 5, 5, ("Bug Fix", "Other")  # request types that can attach screenshots
+MAX_IMAGES, MAX_IMAGE_MB, SHOT_TYPES = 5, 5, ("Other",)  # request types that can attach screenshots
 def image_mime(d):
     if d.startswith(b"\x89PNG"): return "image/png"
     if d.startswith(b"\xff\xd8\xff"): return "image/jpeg"
@@ -434,19 +514,28 @@ def parse_images(items):
         out.append((name, mime, data))
     return out
 
+MAX_PDFS, MAX_PDF_MB = 5, 10
+def parse_pdfs(items):
+    if len(items) > MAX_PDFS: raise HTTPException(400, f"You can attach up to {MAX_PDFS} PDF files")
+    out = []
+    for x in items:
+        name = str(x.get("name") or "document.pdf")[:120]
+        try: data = base64.b64decode(str(x.get("data", "")).split(",", 1)[-1], validate=True)
+        except Exception: raise HTTPException(400, f"{name} could not be read")
+        if len(data) > MAX_PDF_MB * 1024 * 1024: raise HTTPException(400, f"{name} is larger than {MAX_PDF_MB} MB")
+        if not data.startswith(b"%PDF"): raise HTTPException(400, f"{name} is not a PDF file")
+        out.append((name, data))
+    return out
+
 def parse_access(a, u):
     kind, res, level = str(a.get("type", "")), str(a.get("resource", "")).strip(), str(a.get("level", ""))
     if kind not in ACCESS_TYPES: raise HTTPException(400, "Choose what you need access to")
-    if not res: raise HTTPException(400, "Enter the server, repository or system you need access to")
-    if level not in ACCESS_LEVELS: raise HTTPException(400, "Choose an access level")
-    who = ",".join(email_list(str(a.get("for", "")))) or u["email"]  # blank means the requester
-    until = str(a.get("until", "")).strip()
-    if until:
-        try: d = datetime.fromisoformat(until).date()
-        except ValueError: raise HTTPException(400, "Enter a valid 'needed until' date")
-        if d < datetime.now().date(): raise HTTPException(400, "'Needed until' date is in the past")
-        until = d.isoformat()
-    return {"type": kind, "resource": res[:300], "level": level, "for": who, "until": until}
+    if kind == "Model Endpoint": res, level = "", ""  # the admin sends the endpoint URL and key when closing
+    elif not res: raise HTTPException(400, "Enter the repository or VPN you need access to")
+    if kind == "VPN": level = ""  # VPN access has no read/write level
+    elif kind != "Model Endpoint" and level not in ACCESS_LEVELS: raise HTTPException(400, "Choose an access level")
+    # Access is always for the requester; the admin decides how long it lasts
+    return {"type": kind, "resource": res[:300], "level": level, "for": u["email"], "until": ""}
 
 @app.post("/api/requests")
 def create(b: ReqIn, u=Depends(user)):
@@ -549,44 +638,110 @@ def hold(rid: str, b: HoldIn, u=Depends(user)):
     if not b.reason.strip(): raise HTTPException(400, "Give a reason for putting the ticket on hold")
     return _transition(rid, u, ["IN PROGRESS"], "ON HOLD", f"Put on hold by {u['name']}: {b.reason.strip()}")
 @app.post("/api/requests/{rid}/resume")
-def resume(rid: str, u=Depends(user)): return _transition(rid, u, ["ON HOLD"], "IN PROGRESS", f"Work resumed by {u['name']}")
+def resume(rid: str, u=Depends(user)):
+    if get_ticket(rid, u)["fix_open"]: raise HTTPException(400, "This deployment is waiting for a bug fix. Use Resubmit for Redeployment once it is fixed.")
+    return _transition(rid, u, ["ON HOLD"], "IN PROGRESS", f"Work resumed by {u['name']}")
 @app.post("/api/requests/{rid}/close")
 def close(rid: str, b: CloseIn, u=Depends(user)):
     t = get_ticket(rid, u)
     acc = t["type"] == "Access Request"  # access tickets record the access outcome; the URL is optional
     if b.deploy_status not in (ACCESS_STATUSES if acc else DEPLOY_STATUSES): raise HTTPException(400, "Choose a status")
     if b.env not in ENVS: raise HTTPException(400, "Choose an environment")
-    missing = [n for n, v in (("date/time", b.deployed_at), ("access given" if acc else "deployment notes", b.notes),
-                              ("resolution details", b.resolution), *(() if acc else (("URL", b.deploy_url),))) if not v.strip()]
+    if t["fix_open"]: raise HTTPException(400, "This deployment is waiting for a bug fix. Resubmit it for redeployment first.")
+    missing = [n for n, v in (("date/time", b.deployed_at), *((("access given", b.notes),) if acc else (("deployment URL", b.deploy_url),))) if not v.strip()]
     if missing: raise HTTPException(400, "Please fill in: " + ", ".join(missing))
     url = b.deploy_url.strip()
     if url and not URL_RE.match(url): raise HTTPException(400, "URL must start with http:// or https://")
     try: deployed = datetime.fromisoformat(b.deployed_at.strip()).astimezone()  # browser sends local time without a zone
     except ValueError: raise HTTPException(400, "Enter a valid date/time")
     issues = b.issues.strip() or "None"
+    vpn = acc and (t["access"] or {}).get("type") == "VPN" and b.deploy_status != "Rejected"
+    vuser, vpw = (b.vpn_user.strip(), b.vpn_password.strip()) if vpn else ("", "")
+    if vpn and not (vuser and vpw): raise HTTPException(400, "Enter the VPN username and password for the user")
+    ep = acc and (t["access"] or {}).get("type") == "Model Endpoint" and b.deploy_status != "Rejected"
+    key = b.api_key.strip() if ep else ""
+    if ep and not url: raise HTTPException(400, "Enter the model endpoint URL for the user")
+    pdfs = parse_pdfs(b.files) if acc else []
     with tx() as c:
         cur = lock(c, t); must_own(cur, t, u)
         if cur["status"] not in ACTIVE: raise HTTPException(400, f"This ticket is {cur['status']}, so it cannot be closed")
-        c.execute("""insert into ticket_resolutions(ticket_id,deploy_status,deployed_at,notes,issues,resolution,deploy_url,version,environment,closed_by)
-                     values(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-                  (t["id"], b.deploy_status, deployed, b.notes.strip(), issues, b.resolution.strip(), url, b.version.strip(), b.env, u["id"]))
+        c.execute("""insert into ticket_resolutions(ticket_id,deploy_status,deployed_at,notes,issues,resolution,deploy_url,version,environment,closed_by,vpn_user,vpn_password,api_key)
+                     values(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                  (t["id"], b.deploy_status, deployed, b.notes.strip(), issues, b.resolution.strip(), url, b.version.strip(), b.env, u["id"], vuser, vpw, key))
+        for name, data in pdfs:
+            c.execute("insert into ticket_files(ticket_id,name,data) values(%s,%s,%s)", (t["id"], name, data))
         c.execute("update tickets set status='CLOSED', updated_at=now() where id=%s", (t["id"],))
         hist(c, t["id"], "CLOSED", u["id"], f"Closed by {u['name']} <{u['email']}>. "
-             + (f"{b.deploy_status} at {fmt(deployed)}." if acc else f"Deployment {b.deploy_status} at {fmt(deployed)}. URL: {url}"),
+             + (f"{b.deploy_status} at {fmt(deployed)}." + (f" {len(pdfs)} PDF(s) attached." if pdfs else "") if acc else f"Deployment {b.deploy_status} at {fmt(deployed)}. URL: {url}"),
              cur["status"], "CLOSED")
     if acc:
         a = t["access"] or {}
         msg = (f"Access request {rid} has been closed by {u['name']} <{u['email']}>.\n\nTitle: {t['title']}\nResult: {b.deploy_status}\n"
-               f"Access To: {a.get('type', '-')} - {a.get('resource', '-')}\nAccess Level: {a.get('level', '-')}   Environment: {b.env}\n"
-               f"Access For: {a.get('for', '-')}\nCompleted At: {fmt(deployed)}\n" + (f"Link: {url}\n" if url else "")
-               + f"\nAccess Given:\n{b.notes.strip()}\n\nIssues Encountered:\n{issues}\n\nResolution:\n{b.resolution.strip()}\n\nOpen ticket: {link(rid)}")
+               f"Access To: {a.get('type', '-')} - {a.get('resource', '-')}\nAccess Level: {a.get('level') or '-'}\n"
+               f"Access For: {a.get('for', '-')}\nCompleted At: {fmt(deployed)}\n" + (f"{'Model Endpoint URL' if ep else 'Link'}: {url}\n" if url else "")
+               + (f"VPN Username: {vuser}\nThe VPN password is not sent by email. Sign in and open the ticket to see it.\n" if vpn else "")
+               + ("The API key is not sent by email. Sign in and open the ticket to see it.\n" if key else "")
+               + (f"Attached PDFs: {', '.join(n for n, _ in pdfs)} (download them from the ticket)\n" if pdfs else "")
+               + f"\nAccess Given:\n{b.notes.strip()}\n\nOpen ticket: {link(rid)}")
     else:
         msg = (f"Ticket {rid} has been closed by {u['name']} <{u['email']}>.\n\nTitle: {t['title']}\nDeployment Status: {b.deploy_status}\n"
-               f"Deployed At: {fmt(deployed)}\nDeployment URL: {url}\nVersion: {b.version.strip() or '-'}   Environment: {b.env}\n\n"
-               f"Deployment Notes:\n{b.notes.strip()}\n\nIssues Encountered:\n{issues}\n\nResolution:\n{b.resolution.strip()}\n\nOpen ticket: {link(rid)}")
+               f"Deployed At: {fmt(deployed)}\nDeployment URL: {url}\nVersion: {b.version.strip() or '-'}   Environment: {b.env}\n"
+               + (f"\nDeployment Notes:\n{b.notes.strip()}\n" if b.notes.strip() else "") + f"\nOpen ticket: {link(rid)}")
     grantees = email_list(t["access"]["for"]) if acc and t["access"] else []  # the people the access is for hear the outcome too
     for e in sorted({t["remail"], *admin_emails(), *email_list(t["cc"]), *grantees} - {None, u["email"]}):
         notify(e, t["id"], msg, f"[{rid}] Ticket closed: {t['title']}")
+    return {"ok": True}
+
+# ---------------- Failed deployments: bug report, fix, resubmit ----------------
+@app.post("/api/requests/{rid}/fail")
+def fail(rid: str, b: FailIn, u=Depends(user)):
+    # The owner (or an admin) marks the deployment Failed / Bug Fix Required; it waits ON HOLD until it is resubmitted
+    t = get_ticket(rid, u); desc = b.description.strip()
+    if t["type"] == "Access Request": raise HTTPException(400, "Access requests cannot be marked as a failed deployment")
+    if not desc: raise HTTPException(400, "Describe the bugs or errors you found")
+    images = parse_images(b.images)
+    with tx() as c:
+        cur = lock(c, t)
+        if u["role"] != "admin": must_own(cur, t, u)
+        if cur["status"] not in ACTIVE: raise HTTPException(400, f"This ticket is {cur['status']}, so it cannot be marked as failed")
+        if c.execute("select 1 from deploy_bugs where ticket_id=%s and fixed_at is null", (t["id"],)).fetchone():
+            raise HTTPException(400, "This deployment is already waiting for a bug fix")
+        bug = c.execute("insert into deploy_bugs(ticket_id,description,reported_by) values(%s,%s,%s) returning id", (t["id"], desc, u["id"])).fetchone()
+        for name, mime, data in images:
+            c.execute("insert into ticket_images(ticket_id,name,mime,data,bug_id) values(%s,%s,%s,%s,%s)", (t["id"], name, mime, data, bug["id"]))
+        c.execute("update tickets set status='ON HOLD', updated_at=now() where id=%s", (t["id"],))
+        hist(c, t["id"], "DEPLOY_FAILED", u["id"], f"Failed / Bug Fix Required, reported by {u['name']}"
+             + (f" with {len(images)} screenshot(s)" if images else "") + f": {desc if len(desc) <= 120 else desc[:117] + '...'}", cur["status"], "ON HOLD")
+    msg = (f"Deployment {rid} ({t['title']}) failed and needs a bug fix.\n\nReported by {u['name']} <{u['email']}>:\n{desc}\n"
+           + (f"\n{len(images)} screenshot(s) attached on the ticket.\n" if images else "")
+           + f"\nPlease fix the issues, then open the ticket and use Resubmit for Redeployment.\n\nOpen ticket: {link(rid)}")
+    for e in sorted({t["remail"], t["aemail"], *admin_emails(), *email_list(t["cc"])} - {None, u["email"]}):
+        notify(e, t["id"], msg, f"[{rid}] Deployment failed: bug fix required")
+    return {"ok": True}
+@app.post("/api/requests/{rid}/resubmit")
+def resubmit(rid: str, b: ResubmitIn, u=Depends(user)):
+    # After the fix, the requester (or the owner or an admin) sends the deployment back to the owner to redeploy
+    t = get_ticket(rid, u); notes, branch, pr = b.fix_notes.strip(), b.branch.strip(), b.pr_url.strip()
+    if not (u["role"] == "admin" or u["id"] in (t["requester_id"], t["assignee_id"])):
+        raise HTTPException(403, "Only the requester, the owner or an admin can resubmit this deployment")
+    if not notes: raise HTTPException(400, "Describe what was fixed")
+    if branch and not BRANCH_RE.match(branch): raise HTTPException(400, "Branch name can only use letters, numbers and _ . / - (no spaces)")
+    if pr and not URL_RE.match(pr): raise HTTPException(400, "Pull Request URL must start with http:// or https://")
+    with tx() as c:
+        cur = lock(c, t)
+        bug = c.execute("select id from deploy_bugs where ticket_id=%s and fixed_at is null for update", (t["id"],)).fetchone()
+        if not bug or cur["status"] == "CLOSED": raise HTTPException(400, "This deployment is not waiting for a bug fix")
+        c.execute("update deploy_bugs set fix_notes=%s, fixed_by=%s, fixed_at=now() where id=%s", (notes, u["id"], bug["id"]))
+        c.execute("update tickets set status='IN PROGRESS', branch=coalesce(nullif(%s,''),branch), pr_url=coalesce(nullif(%s,''),pr_url), updated_at=now() where id=%s",
+                  (branch, pr, t["id"]))
+        hist(c, t["id"], "RESUBMITTED", u["id"], f"Fixed and resubmitted for redeployment by {u['name']}"
+             + (f" (branch {branch})" if branch and branch != t["branch"] else "") + f": {notes if len(notes) <= 120 else notes[:117] + '...'}",
+             cur["status"], "IN PROGRESS")
+    msg = (f"The bugs in deployment {rid} ({t['title']}) were fixed by {u['name']} and it is ready to redeploy.\n\nWhat was fixed:\n{notes}\n"
+           + (f"Branch: {branch}\n" if branch else "") + (f"Pull Request: {pr}\n" if pr else "")
+           + f"\n{t['aname'] or 'The owner'}, please redeploy it and close the ticket.\n\nOpen ticket: {link(rid)}")
+    for e in sorted({t["remail"], t["aemail"], *admin_emails(), *email_list(t["cc"])} - {None, u["email"]}):
+        notify(e, t["id"], msg, f"[{rid}] Bug fixed: ready to redeploy")
     return {"ok": True}
 
 # ---------------- Users & roles (admin) ----------------
@@ -594,7 +749,7 @@ def close(rid: str, b: CloseIn, u=Depends(user)):
 def users(u=Depends(admin)):
     return q("""select u.id, u.name, u.email, u.role, (u.pw_hash is not null) active, u.created_at,
                   (select count(*) from tickets t where t.assignee_id=u.id and t.status<>'CLOSED') owned_open
-                from users u order by array_position(array['admin','engineer','user'], u.role), u.name""")
+                from users u where u.deleted_at is null order by array_position(array['admin','engineer','user'], u.role), u.name""")
 
 @app.get("/api/team")
 def team(u=Depends(admin)):
@@ -607,7 +762,7 @@ def set_role(uid: int, b: RoleIn, u=Depends(admin)):
     if b.role not in ROLES: raise HTTPException(400, "Invalid role")
     if uid == u["id"]: raise HTTPException(400, "You cannot change your own role")
     with tx() as c:
-        x = c.execute("select id, email, role from users where id=%s for update", (uid,)).fetchone()
+        x = c.execute("select id, email, role from users where id=%s and deleted_at is null for update", (uid,)).fetchone()
         if not x: raise HTTPException(404, "User not found")
         if x["role"] == b.role: return {"ok": True}
         if b.role == "user":
@@ -616,6 +771,30 @@ def set_role(uid: int, b: RoleIn, u=Depends(admin)):
         c.execute("update users set role=%s, updated_at=now() where id=%s", (b.role, uid))
         audit(c, u["id"], "ROLE_CHANGED", x["email"], f"{x['role']} -> {b.role}")
     return {"ok": True}
+
+@app.delete("/api/users/{uid}")
+def delete_user(uid: int, u=Depends(admin)):
+    # Accounts with no tickets, comments or history are removed completely. Accounts with history are anonymised instead:
+    # they can no longer sign in, their email is freed (they can register again), and their name stays on old tickets.
+    if uid == u["id"]: raise HTTPException(400, "You cannot delete your own account")
+    with tx() as c:
+        x = c.execute("select id, name, email, role from users where id=%s and deleted_at is null for update", (uid,)).fetchone()
+        if not x: raise HTTPException(404, "User not found")
+        if x["email"] in configured_admin_emails():
+            raise HTTPException(400, f"{x['email']} is listed in ADMIN_EMAILS, so it would be created again on the next restart. Remove it from .env first.")
+        n = c.execute("select count(*) c from tickets where assignee_id=%s and status<>'CLOSED'", (uid,)).fetchone()["c"]
+        if n: raise HTTPException(400, f"{x['email']} still owns {n} open ticket(s). Reassign them first.")
+        try:
+            with c.transaction():  # savepoint: a foreign-key error only undoes this delete
+                c.execute("delete from users where id=%s", (uid,))
+            how = "deleted"
+        except psycopg.errors.ForeignKeyViolation:
+            c.execute("""update users set name=%s, email=%s, pw_hash=null, role='user', deleted_at=now(), updated_at=now() where id=%s""",
+                      (f"{x['name']} (deleted)", f"deleted-{uid}@{DELETED_DOMAIN}", uid))
+            c.execute("delete from notifications where user_id=%s", (uid,))
+            how = "anonymised"
+        audit(c, u["id"], "USER_DELETED", x["email"], f"{x['name']} ({x['role']}) " + ("removed" if how == "deleted" else "deleted; kept on old tickets as a deleted user"))
+    return {"ok": True, "how": how}
 
 # ---------------- Notifications ----------------
 @app.get("/api/notifications")
@@ -628,6 +807,8 @@ def read(u=Depends(user)): run("update notifications set seen=true where user_id
 # ---------------- Frontend (React) ----------------
 PAGE = r"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>MLOps Service Desk</title>
+<script>/* apply the saved theme before the page paints, so dark mode never flashes white */
+try{var t=localStorage.getItem('theme')||'light';document.documentElement.dataset.theme=(t==='dark'||(t==='system'&&matchMedia('(prefers-color-scheme: dark)').matches))?'dark':'light'}catch(e){}</script>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%234f46e5'/%3E%3Ctext x='16' y='23' font-size='20' text-anchor='middle' fill='white'%3E%E2%9A%99%3C/text%3E%3C/svg%3E">
 <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
 <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
@@ -641,7 +822,8 @@ a.l{color:var(--p);cursor:pointer;font-weight:600;text-decoration:none;word-brea
 .app{display:flex;min-height:100vh}
 .side{width:260px;background:linear-gradient(180deg,#0f172a,#1e1b4b);color:#cbd5e1;display:flex;flex-direction:column;position:fixed;top:0;bottom:0;left:0;z-index:40;padding:20px 14px;transition:transform .25s}
 .brand{display:flex;gap:12px;align-items:center;padding:4px 10px 20px;border-bottom:1px solid #ffffff18;margin-bottom:16px}
-.logo{width:42px;height:42px;border-radius:12px;background:linear-gradient(135deg,#6366f1,#8b5cf6);display:grid;place-items:center;color:#fff;font-size:20px;box-shadow:0 6px 16px #6366f166}
+.logo{height:36px;width:auto;display:block;flex-shrink:0;object-fit:contain}
+.brand{cursor:pointer;border-radius:12px}.brand:hover .logo{transform:scale(1.06)}.logo{transition:transform .15s}.brand:focus-visible{outline:2px solid #a5b4fc;outline-offset:2px}
 .brand b{color:#fff;display:block;font-size:16px}.brand small{color:#94a3b8}
 .menu{flex:1;display:flex;flex-direction:column;gap:6px}
 .nl{display:flex;align-items:center;gap:12px;padding:12px 14px;border-radius:10px;color:#cbd5e1;cursor:pointer;font-weight:500;font-size:15px;transition:.15s;user-select:none}
@@ -720,6 +902,8 @@ td{padding:13px 12px;border-bottom:1px solid #f1f5f9;text-align:left;vertical-al
 .msg.me{align-self:flex-end;background:linear-gradient(135deg,#6366f1,#7c3aed);color:#fff;border-top-left-radius:14px;border-top-right-radius:4px}
 .msg small{opacity:.75;display:block;margin-bottom:3px}
 .chatbox{display:flex;gap:10px;align-items:flex-end}.chatbox textarea{margin:0;flex:1}
+.pdfs{list-style:none;padding:0;margin:2px 0 14px;display:flex;flex-direction:column;gap:6px}.pdfs li{display:flex;align-items:center;gap:8px}
+.btn.sm{padding:4px 10px;font-size:13px;border-radius:8px}.btn.del{color:#dc2626;border-color:#fecaca}.btn.del:hover{background:#fef2f2}.secret{display:inline-flex;align-items:center;gap:8px;flex-wrap:wrap}.secret code{font-size:14px}
 .shots{display:flex;flex-wrap:wrap;gap:10px;margin:2px 0 14px}.shot{position:relative;width:120px;height:90px;border:1px solid #cbd5e1;border-radius:10px;overflow:hidden;background:#f8fafc;display:flex;align-items:center;justify-content:center;color:#64748b;font-size:12px}
 .shot img{width:100%;height:100%;object-fit:cover;cursor:zoom-in}.shot button{position:absolute;top:4px;right:4px;width:22px;height:22px;border:0;border-radius:50%;background:rgba(15,23,42,.7);color:#fff;cursor:pointer;line-height:22px;padding:0}
 .lightbox{position:fixed;inset:0;z-index:100;background:rgba(15,23,42,.85);display:flex;align-items:center;justify-content:center;padding:24px;cursor:zoom-out}.lightbox img{max-width:100%;max-height:100%;border-radius:8px}
@@ -727,6 +911,11 @@ td{padding:13px 12px;border-bottom:1px solid #f1f5f9;text-align:left;vertical-al
 .update button{border:0;border-radius:8px;background:#6366f1;color:#fff;font:inherit;font-weight:600;padding:6px 14px;cursor:pointer}
 .nt{display:flex;gap:14px;padding:14px;border-radius:12px;background:#f8fafc;margin-bottom:10px;border:1px solid #eef2f7}
 .nt .ic{width:38px;height:38px;border-radius:50%;background:#eef2ff;color:var(--p);display:grid;place-items:center;flex:none}
+.b.BUGFIX{background:#fee2e2;color:#991b1b}
+.modal{position:fixed;inset:0;z-index:90;background:rgba(15,23,42,.55);display:flex;align-items:center;justify-content:center;padding:16px}
+.modal form{background:var(--card);border-radius:16px;padding:22px;width:100%;max-width:560px;max-height:calc(100vh - 32px);overflow:auto;box-shadow:0 20px 50px #0004}
+.bugrep{border:1px solid #fecaca;background:#fef2f2;border-radius:12px;padding:12px 14px;margin-top:12px}.bugrep.fixed{border-color:var(--bd);background:transparent}
+html[data-theme="dark"] .bugrep{background:#2a1215;border-color:#7f1d1d}html[data-theme="dark"] .bugrep.fixed{background:transparent;border-color:var(--bd)}
 .done-box{background:#f0fdf4;border:1px solid #bbf7d0;border-radius:12px;padding:16px;margin-top:16px}
 .done-box td{border-color:#dcfce7}.done-box tbody tr:hover{background:transparent}
 .kv td{white-space:pre-wrap}.kv td:first-child{width:190px;font-weight:600;color:#475569;white-space:normal}
@@ -735,7 +924,7 @@ td{padding:13px 12px;border-bottom:1px solid #f1f5f9;text-align:left;vertical-al
 /* ---------- auth ---------- */
 .authwrap{min-height:100vh;display:grid;grid-template-columns:1.1fr 1fr}
 .hero{background:linear-gradient(135deg,#0f172a,#312e81 60%,#6d28d9);color:#fff;padding:60px;display:flex;flex-direction:column;justify-content:center}
-.hero .logo{width:56px;height:56px;font-size:28px}.hero h1{font-size:34px;margin:22px 0 10px}.hero p{color:#c7d2fe;font-size:16px;max-width:430px}
+.hero .logo{height:64px}.hero h1{font-size:34px;margin:22px 0 10px}.hero p{color:#c7d2fe;font-size:16px;max-width:430px}
 .hero ul{list-style:none;padding:0;margin:26px 0 0}.hero li{margin:12px 0;color:#e0e7ff;display:flex;gap:10px;align-items:center}
 .hero li span{width:24px;height:24px;border-radius:50%;background:#ffffff22;display:grid;place-items:center}
 .formside{display:grid;place-items:center;padding:30px;background:#fff}.formcard{width:100%;max-width:420px}
@@ -747,6 +936,52 @@ td{padding:13px 12px;border-bottom:1px solid #f1f5f9;text-align:left;vertical-al
 .dev{background:#eef2ff;color:#3730a3;padding:10px 14px;border-radius:10px;margin-bottom:16px}
 .meter{height:6px;background:#e2e8f0;border-radius:6px;overflow:hidden;margin:-4px 0 6px}.meter i{display:block;height:100%;transition:.3s}
 .ok{width:84px;height:84px;border-radius:50%;background:#dcfce7;color:#16a34a;display:grid;place-items:center;margin:0 auto 14px}
+/* ---------- settings ---------- */
+.side .nl.set{margin-top:4px}
+.seg3{display:inline-flex;gap:4px;background:var(--bg);border:1px solid var(--bd);padding:4px;border-radius:12px;flex-wrap:wrap}
+.seg3 button{border:0;background:transparent;color:var(--mu);font:inherit;font-weight:600;padding:9px 16px;border-radius:9px;cursor:pointer;display:inline-flex;gap:8px;align-items:center}
+.seg3 button:hover{color:var(--tx)}.seg3 button.on{background:var(--card);color:var(--p);box-shadow:0 1px 4px #0f172a1a}
+.seg3 button:focus-visible,.nl:focus-visible{outline:2px solid var(--p);outline-offset:2px}
+/* ---------- dark theme (Settings > Appearance; the choice is stored per browser) ---------- */
+html[data-theme="dark"]{color-scheme:dark;--p:#6366f1;--p2:#818cf8;--bg:#0b1020;--card:#141a2c;--tx:#e2e8f0;--mu:#94a3b8;--bd:#263049}
+html[data-theme="dark"] a.l{color:#a5b4fc}
+html[data-theme="dark"] .top{background:#0e1424e6}
+html[data-theme="dark"] .burger,html[data-theme="dark"] .btn.ghost{background:var(--card);color:var(--tx)}
+html[data-theme="dark"] .btn.ghost:hover{background:#1c2438}
+html[data-theme="dark"] .card,html[data-theme="dark"] .stat{background:var(--card);border-color:#1f2740;box-shadow:0 1px 3px #0006}
+html[data-theme="dark"] .stat.click:hover{border-color:#4f46e5}
+html[data-theme="dark"] .stat .ic{box-shadow:inset 0 0 0 100px #0009}html[data-theme="dark"] .stat .ic svg{filter:brightness(1.9)}
+html[data-theme="dark"] label{color:#cbd5e1}
+html[data-theme="dark"] input,html[data-theme="dark"] select,html[data-theme="dark"] textarea{background:#0e1424;border-color:#334155;color:var(--tx)}
+html[data-theme="dark"] .note{background:#13203f;border-color:#1e3a8a;color:#bfdbfe}
+html[data-theme="dark"] .note.warn{background:#2e2108;border-color:#78350f;color:#fcd34d}
+html[data-theme="dark"] .ownbox{background:#211a3a;border-color:#4c1d95}
+html[data-theme="dark"] th{background:#10172a}html[data-theme="dark"] td{border-color:#1c2439}html[data-theme="dark"] tbody tr:hover{background:#18203a}
+html[data-theme="dark"] .b{background:#1e3a8a66;color:#93c5fd}
+html[data-theme="dark"] .b.CLOSED,html[data-theme="dark"] .b.LOW{background:#14532d80;color:#86efac}
+html[data-theme="dark"] .b.ASSIGNED,html[data-theme="dark"] .b.MEDIUM{background:#78350f80;color:#fcd34d}
+html[data-theme="dark"] .b.HIGH,html[data-theme="dark"] .b.CRITICAL{background:#7f1d1d80;color:#fca5a5}
+html[data-theme="dark"] .b.INPROGRESS,html[data-theme="dark"] .b.engineer{background:#0c4a6e80;color:#7dd3fc}
+html[data-theme="dark"] .b.ONHOLD,html[data-theme="dark"] .b.user{background:#33415580;color:#cbd5e1}
+html[data-theme="dark"] .b.admin{background:#4c1d9580;color:#c4b5fd}
+html[data-theme="dark"] .tabs{background:#0e1424}html[data-theme="dark"] .tabs a{color:var(--mu)}html[data-theme="dark"] .tabs a.on{background:var(--card);color:#a5b4fc}
+html[data-theme="dark"] .seg3 button.on{color:#a5b4fc}
+html[data-theme="dark"] .sbar,html[data-theme="dark"] .meter{background:#263049}
+html[data-theme="dark"] .legend,html[data-theme="dark"] .hbar span,html[data-theme="dark"] .kv td:first-child{color:var(--mu)}
+html[data-theme="dark"] .hbar div{background:#1c2439}html[data-theme="dark"] .act{border-color:#1c2439}
+html[data-theme="dark"] .step{color:#64748b}html[data-theme="dark"] .step.done{color:#86efac}
+html[data-theme="dark"] .seg::before,html[data-theme="dark"] .dot{background:#263049}html[data-theme="dark"] .dot{color:var(--mu);border-color:var(--card)}
+html[data-theme="dark"] .seg.done::before,html[data-theme="dark"] .step.done .dot{background:#16a34a}
+html[data-theme="dark"] .tip{background:#020617;border:1px solid #334155}
+html[data-theme="dark"] .msg{background:#1c2439}
+html[data-theme="dark"] .shot{background:#0e1424;border-color:#334155}
+html[data-theme="dark"] .nt{background:#10172a;border-color:#1f2740}html[data-theme="dark"] .nt .ic{background:#1e1b4b;color:#a5b4fc}
+html[data-theme="dark"] .done-box{background:#062a19;border-color:#14532d}html[data-theme="dark"] .done-box td{border-color:#14532d}
+html[data-theme="dark"] .formside{background:var(--card)}
+html[data-theme="dark"] .eye:hover{background:#1c2438}
+html[data-theme="dark"] .dev{background:#1e1b4b;color:#c7d2fe}
+html[data-theme="dark"] .ok{background:#14532d80;color:#86efac}
+html[data-theme="dark"] .toast{background:#020617;border:1px solid #334155}
 @media(max-width:960px){
   .side{transform:translateX(-100%)}.side.open{transform:none}.main{margin-left:0}.burger{display:grid}
   .shade.on{display:block;position:fixed;inset:0;background:#0f172a88;z-index:35}
@@ -761,25 +996,31 @@ td{padding:13px 12px;border-bottom:1px solid #f1f5f9;text-align:left;vertical-al
 const {useState,useEffect,useCallback,useRef}=React;
 const STAT=["NEW","ASSIGNED","IN PROGRESS","ON HOLD","CLOSED"],TRACK=["NEW","ASSIGNED","IN PROGRESS","CLOSED"],ACTIVE=["ASSIGNED","IN PROGRESS","ON HOLD"];
 const DESC={"NEW":"Waiting for assignment","ASSIGNED":"Owner assigned","IN PROGRESS":"Work in progress","ON HOLD":"Paused by the owner","CLOSED":"Resolved and closed"};
-const ROLES=["user","engineer","admin"],ROLE_NAME={user:'User',engineer:'ML Engineer',admin:'Admin'};
-const ACTION={CREATED:'Created',ASSIGNED:'Assigned',REASSIGNED:'Reassigned',OWNERSHIP_TAKEN:'Ownership taken',STATUS_CHANGED:'Status changed',COMMENTED:'Comment',CLOSED:'Closed'};
-const TYPES=["Deployment Request","Access Request","Bug Fix","Other"],PRIOS=["LOW","MEDIUM","HIGH","CRITICAL"],ENVS=["Development","Staging","Production"];
-const DEPLOY=["Successful","Partially Successful","Failed","Rolled Back"],ACCESS_STAT=["Access Granted","Partially Granted","Rejected"];
+const ROLES=["user","engineer","admin"],ROLE_NAME={user:'User',engineer:'MLOps Engineer',admin:'Admin'};
+const ACTION={CREATED:'Created',ASSIGNED:'Assigned',REASSIGNED:'Reassigned',OWNERSHIP_TAKEN:'Ownership taken',STATUS_CHANGED:'Status changed',COMMENTED:'Comment',CLOSED:'Closed',
+  DEPLOY_FAILED:'Failed / bug fix required',RESUBMITTED:'Resubmitted for redeployment'};
+const TYPES=["Deployment Request","Access Request","Other"],PRIOS=["LOW","MEDIUM","HIGH","CRITICAL"],ENVS=["Development","Staging","Production"];
+const DEPLOY=["Successfully Deployed","Failed / Bug Fix Required"],FAILED=DEPLOY[1],ACCESS_STAT=["Access Granted","Partially Granted","Rejected"];
 const ACCESS_LEVELS=["Read only","Read & Write","Admin"];
 // What to ask for in the "server / system" box, per kind of access
-const ACCESS_TYPES={"Server (SSH)":["Server hostname or IP","ml-prod-01 / 10.10.5.21"],"Git Repository":["Repository name or URL","https://github.com/org/ml-model-service"],
-  "Database":["Database host and name","prod-db-01 / features_db"],"AWS / Cloud Console":["AWS account and service","ml-prod account - S3, SageMaker"],
-  "Kubernetes Cluster":["Cluster and namespace","eks-prod / ml-serving"],"VPN":["VPN name or location","Office VPN"],
-  "Monitoring (Grafana)":["Dashboard or folder","MLOps / Model Latency"],"Other":["System name","Describe the system"]};
+const ACCESS_TYPES={"Git Repository":["Repository name or URL","https://github.com/org/ml-model-service"],
+  "Model Endpoint":["Model endpoint name or URL","https://ml.example.com/v1/fraud-model"],"VPN":["VPN name or location","Office VPN"]};
+// Reads chosen files as data: URLs, the way the API expects uploads
+const readFiles=files=>Promise.all(files.map(x=>new Promise((ok,no)=>{const fr=new FileReader();fr.onload=()=>ok({name:x.name,data:fr.result});fr.onerror=no;fr.readAsDataURL(x)})));
 const P={dash:'M3 3h7v9H3zM14 3h7v5h-7zM14 12h7v9h-7zM3 16h7v5H3z',plus:'M12 5v14M5 12h14',list:'M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01',
 bell:'M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9M13.7 21a2 2 0 0 1-3.4 0',out:'M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9',
 queue:'M22 12h-6l-2 3h-4l-2-3H2M5.5 5.1L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.5-6.9A2 2 0 0 0 16.7 4H7.3a2 2 0 0 0-1.8 1.1z',
 user:'M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2M12 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8z',
 users:'M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75',
-pause:'M6 4h4v16H6zM14 4h4v16h-4z',
+pause:'M6 4h4v16H6zM14 4h4v16h-4z',file:'M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8zM14 2v6h6',
 vol:'M11 5L6 9H2v6h4l5 4V5zM15.5 8.5a5 5 0 0 1 0 7M19 5a10 10 0 0 1 0 14',mute:'M11 5L6 9H2v6h4l5 4V5zM23 9l-6 6M17 9l6 6',
 eye:'M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8zM12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z',
 eyeOff:'M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19M14.12 14.12a3 3 0 1 1-4.24-4.24M1 1l22 22',
+key:'M21 2l-2 2m-7.6 7.6a5.5 5.5 0 1 1-7.78 7.78 5.5 5.5 0 0 1 7.78-7.78zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4',
+gear:'M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z',
+sun:'M12 17a5 5 0 1 0 0-10 5 5 0 0 0 0 10zM12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42',
+moon:'M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z',
+monitor:'M2 3h20v14H2zM8 21h8M12 17v4',
 menu:'M3 6h18M3 12h18M3 18h18',check:'M20 6L9 17l-5-5',clock:'M12 6v6l4 2M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20z',send:'M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z'};
 const Ic=({n,s=19})=><svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d={P[n]}/></svg>;
 async function api(path,method='GET',body){
@@ -789,7 +1030,9 @@ async function api(path,method='GET',body){
   if(!r.ok) throw new Error(typeof d.detail==='string'?d.detail:'Please check your input');
   return d;
 }
-const Badge=({v})=><span className={'b '+v.replace(' ','')}>{v}</span>;
+const Badge=({v,t})=><span className={'b '+v.replace(' ','')}>{t||v}</span>;
+// Status badge for a ticket: a failed deployment waiting for its fix shows BUG FIX REQUIRED instead of ON HOLD
+const StatusBadge=({r})=>r.fix_open?<Badge v="BUG FIX" t="BUG FIX REQUIRED"/>:<Badge v={r.status}/>;  // t: display text when it differs from the value (role names)
 const Tabs=({items,v,set})=><div className="tabs">{items.map(([k,l])=><a key={k} className={v===k?'on':''} onClick={()=>set(k)}>{l}</a>)}</div>;
 const F=({l,...p})=><label>{l}<input {...p}/></label>;
 // Password box with an eye button that shows or hides what was typed
@@ -799,6 +1042,17 @@ function PwField({l,...p}){
     <button type="button" className="eye" onClick={()=>setShow(!show)} title={show?'Hide password':'Show password'} aria-label={show?'Hide password':'Show password'}><Ic n={show?'eyeOff':'eye'} s={18}/></button></div></label>;
 }
 const Row=({k,children})=><tr><td>{k}</td><td>{children}</td></tr>;
+// Screenshot picker shared by the request and bug forms: up to 5 images, 5 MB each
+const pickImgs=async(e,imgs,set,flash)=>{const files=[...e.target.files];e.target.value='';
+  if(imgs.length+files.length>5)return flash('You can attach up to 5 images');
+  const big=files.find(x=>x.size>5*1024*1024);if(big)return flash(`${big.name} is larger than 5 MB`);
+  set([...imgs,...await readFiles(files)])};
+function ImgPicker({imgs,set,flash}){
+  return <><label>Screenshots (optional, up to 5 images, 5 MB each)
+    <input type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple onChange={e=>pickImgs(e,imgs,set,flash)}/></label>
+    {imgs.length>0&&<div className="shots">{imgs.map((x,i)=><div key={i} className="shot"><img src={x.data} alt={x.name}/>
+      <button type="button" title="Remove" onClick={()=>set(imgs.filter((_,j)=>j!==i))}>×</button></div>)}</div>}</>;
+}
 const Url=({u})=>u?<a className="l" href={u} target="_blank" rel="noreferrer">{u}</a>:'-';
 const nowLocal=()=>{const d=new Date();d.setMinutes(d.getMinutes()-d.getTimezoneOffset());return d.toISOString().slice(0,16)};
 const owner=r=>r.assignee_id?`${r.aname} <${r.aemail}>`:'Unassigned';
@@ -817,7 +1071,7 @@ function chime(force){
 
 function ReqTable({rows,go,requester,empty='No tickets yet.'}){
   return <div className="tw"><table><thead><tr><th>ID</th><th>Title</th><th>Priority</th><th>Status</th>{requester&&<th>Requester</th>}<th>Owner</th><th>Updated</th></tr></thead><tbody>
-    {rows.map(r=><tr key={r.rid}><td><a className="l" onClick={()=>go('detail',r.rid)}>{r.rid}</a></td><td>{r.title}</td><td><Badge v={r.priority}/></td><td><Badge v={r.status}/></td>
+    {rows.map(r=><tr key={r.rid}><td><a className="l" onClick={()=>go('detail',r.rid)}>{r.rid}</a></td><td>{r.title}</td><td><Badge v={r.priority}/></td><td><StatusBadge r={r}/></td>
       {requester&&<td>{r.rname}</td>}<td>{r.aname||'Unassigned'}</td><td>{r.updated_at}</td></tr>)}
     {!rows.length&&<tr><td colSpan={requester?7:6} className="empty">{empty}</td></tr>}</tbody></table></div>;
 }
@@ -845,7 +1099,7 @@ const CardHead=({title,children})=><div className="chead"><h3>{title}</h3>{child
 
 /* ---------- Auth screens ---------- */
 function AuthShell({children}){
-  return <div className="authwrap"><div className="hero"><div className="logo">⚙</div><h1>MLOps Service Desk</h1>
+  return <div className="authwrap"><div className="hero"><img className="logo" src="/logo.png" alt="CHAI"/><h1>MLOps Service Desk</h1>
     <p>Raise, track and close deployment, access and bug-fix requests in one place.</p>
     <ul>{['Secure email OTP sign-up','Admin assigns or takes ownership of tickets','Email notifications at every step','Full audit trail for every ticket'].map(t=><li key={t}><span><Ic n="check" s={14}/></span>{t}</li>)}</ul></div>
     <div className="formside"><div className="formcard">{children}</div></div></div>;
@@ -873,7 +1127,7 @@ function Verify({go,reg,setReg,flash}){
     {reg.dev&&<div className="dev">Dev mode (no SMTP): your code is <b>{reg.dev}</b></div>}
     <form onSubmit={submit}><div className="otp">{d.map((v,i)=><input key={i} id={'o'+i} value={v} inputMode="numeric" autoComplete="one-time-code" onChange={e=>set(i,e.target.value)} onPaste={e=>paste(i,e)}
       onKeyDown={e=>{if(e.key==='Backspace'&&!d[i]&&i>0)document.getElementById('o'+(i-1)).focus()}}/>)}</div>
-    <p style={{textAlign:'center',color:'#64748b'}}>Code expires in 10 minutes.</p><button className="btn w" disabled={d.join('').length<6}>Verify</button></form>
+    <p style={{textAlign:'center',color:'var(--mu)'}}>Code expires in 10 minutes.</p><button className="btn w" disabled={d.join('').length<6}>Verify</button></form>
     <p style={{textAlign:'center'}}><a className="l" onClick={resend}>Resend Code</a></p></AuthShell>;
 }
 function SetPassword({go,reg,flash}){
@@ -912,6 +1166,7 @@ function UserDash({me,go}){
   if(!d)return <div className="card">Loading…</div>;
   return <div><h2 className="hello">Welcome, {me.name}!</h2><p className="sub">Your requests at a glance. Click a card to open that list. Updates automatically.</p>
     <StatusCards c={d.raised} pick={s=>go('my',s)} total="All My Requests"/>
+    {d.fix_needed>0&&<div className="note warn" style={{marginTop:0,marginBottom:18}}><b>{d.fix_needed}</b> of your deployments failed and {d.fix_needed>1?'need':'needs'} a bug fix. Open {d.fix_needed>1?'them':'it'}, fix the issues and use Resubmit for Redeployment.</div>}
     {d.need_reply>0&&<div className="note warn" style={{marginTop:0,marginBottom:18}}><b>{d.need_reply}</b> of your open requests {d.need_reply>1?'have':'has'} a reply waiting for you. Open the ticket's Conversation tab.</div>}
     <div className="card"><CardHead title="Recent Requests"><button className="btn" onClick={()=>go('raise')}><Ic n="plus" s={16}/> Raise Request</button></CardHead>
       <ReqTable rows={rows} go={go} empty="You haven't raised any requests yet."/></div></div>;
@@ -921,7 +1176,7 @@ function EngineerDash({me,go}){
   useLive(()=>Promise.all([api('/dashboard').then(setD),api('/assigned?s=ALL').then(x=>setRows(x.rows.filter(r=>r.status!=='CLOSED')))]));
   if(!d)return <div className="card">Loading…</div>;
   const o=d.owned,cb=d.closed_by_me;
-  return <div><h2 className="hello">Welcome, {me.name}!</h2><p className="sub">Tickets you own as an ML Engineer. Click a card to open that list. Updates automatically.</p>
+  return <div><h2 className="hello">Welcome, {me.name}!</h2><p className="sub">Tickets you own as an MLOps Engineer. Click a card to open that list. Updates automatically.</p>
     <div className="grid">
       <Stat label="Total Assigned to Me" value={o.TOTAL} icon="list" color="#4f46e5" bg="#eef2ff" onClick={()=>go('assigned','ALL')}/>
       <Stat label="To Start" value={o.ASSIGNED} icon="user" color={SC.ASSIGNED[0]} bg={SC.ASSIGNED[1]} onClick={()=>go('assigned','ASSIGNED')} sub="Assigned, not started"/>
@@ -959,9 +1214,9 @@ function AdminDash({me,go}){
     </div>
     <div className="card"><CardHead title="Team Workload"><span className="sub" style={{margin:0}}>Open tickets each person owns, and tickets they have closed</span></CardHead>
       <div className="tw"><table><thead><tr><th>Name</th><th>Role</th><th>Assigned</th><th>In Progress</th><th>On Hold</th><th>Open Total</th><th>Closed</th></tr></thead><tbody>
-      {d.workload.map(w=><tr key={w.id}><td>{w.name}<div className="ssub">{w.email}{w.active?'':' · invited'}</div></td><td><Badge v={w.role}/></td>
+      {d.workload.map(w=><tr key={w.id}><td>{w.name}<div className="ssub">{w.email}{w.active?'':' · invited'}</div></td><td><Badge v={w.role} t={ROLE_NAME[w.role]}/></td>
         <td>{w.assigned}</td><td>{w.in_progress}</td><td>{w.on_hold}</td><td><b>{w.assigned+w.in_progress+w.on_hold}</b></td><td>{w.closed}</td></tr>)}
-      {!d.workload.length&&<tr><td colSpan="7" className="empty">No ML Engineers yet. Assign a ticket to someone's email to add one.</td></tr>}</tbody></table></div></div>
+      {!d.workload.length&&<tr><td colSpan="7" className="empty">No MLOps Engineers yet. Assign a ticket to someone's email to add one.</td></tr>}</tbody></table></div></div>
     <div className="card"><CardHead title="Recent Activity"/>
       {d.recent.map(h=><div key={h.id} className="act"><div><b>{h.actor||'System'}</b> {(ACTION[h.action]||h.action).toLowerCase()} <a className="l" onClick={()=>go('detail',h.rid)}>{h.rid}</a>
         {h.to_status&&h.from_status!==h.to_status?<> → <Badge v={h.to_status}/></>:null}<div className="ssub">{h.title}</div></div><small>{h.created_at}</small></div>)}
@@ -969,42 +1224,32 @@ function AdminDash({me,go}){
 }
 function Raise({go,flash}){
   const [f,setF]=useState({title:'',description:'',type:TYPES[0],priority:'HIGH',env:'Production',repo:'',branch:'',pr_url:''}),[busy,setBusy]=useState(false);
-  const [imgs,setImgs]=useState([]),[ac,setAc]=useState({type:'Server (SSH)',resource:'',level:'Read only',for:'',until:''});
+  const [imgs,setImgs]=useState([]),[ac,setAc]=useState({type:'Git Repository',resource:'',level:'Read only',for:'',until:''});
   const u=k=>e=>setF({...f,[k]:e.target.value}),ua=k=>e=>setAc({...ac,[k]:e.target.value});
-  const isAcc=f.type==='Access Request',isOther=f.type==='Other',shots=f.type==='Bug Fix'||isOther,[resLabel,resHint]=ACCESS_TYPES[ac.type];
-  const addImgs=async e=>{const files=[...e.target.files];e.target.value='';
-    if(imgs.length+files.length>5)return flash('You can attach up to 5 images');
-    const big=files.find(x=>x.size>5*1024*1024);if(big)return flash(`${big.name} is larger than 5 MB`);
-    const read=x=>new Promise((ok,no)=>{const fr=new FileReader();fr.onload=()=>ok({name:x.name,data:fr.result});fr.onerror=no;fr.readAsDataURL(x)});
-    setImgs([...imgs,...await Promise.all(files.map(read))])};
+  const isAcc=f.type==='Access Request',isOther=f.type==='Other',shots=isOther,[resLabel,resHint]=ACCESS_TYPES[ac.type];
   const submit=async e=>{e.preventDefault();setBusy(true);try{const r=await api('/requests','POST',{...f,images:shots?imgs:[],access:isAcc?ac:{}});chime();go('submitted',r.rid)}catch(x){flash(x.message);setBusy(false)}};
   return <div className="card" style={{maxWidth:820}}><h2>Raise Request</h2><p className="sub">Fill in the details. The admin will assign an owner.</p><form onSubmit={submit}>
-    <F l="Request Title" value={f.title} onChange={u('title')} required maxLength="200" placeholder={isAcc?'SSH access to ml-prod-01':'Deploy model-service'}/>
+    <F l="Request Title" value={f.title} onChange={u('title')} required maxLength="200" placeholder={isAcc?'Access to the ml-model-service repository':'Deploy model-service'}/>
     <label>{isAcc?'Why do you need this access?':'Description'}<textarea rows="4" value={f.description} onChange={u('description')} required
-      placeholder={isAcc?'I need to check model-service logs on the production server.':'Please deploy the model-service to production.'}/></label>
+      placeholder={isAcc?'I need to push fixes to the model-service repository.':'Please deploy the model-service to production.'}/></label>
     <div className="row2"><label>Request Type<select value={f.type} onChange={u('type')}>{TYPES.map(t=><option key={t}>{t}</option>)}</select></label>
     <label>Priority<select value={f.priority} onChange={u('priority')}>{PRIOS.map(t=><option key={t}>{t}</option>)}</select></label>
     {isAcc&&<label>Access To<select value={ac.type} onChange={ua('type')}>{Object.keys(ACCESS_TYPES).map(t=><option key={t}>{t}</option>)}</select></label>}
     <label>Environment<select value={f.env} onChange={u('env')}>{ENVS.map(t=><option key={t}>{t}</option>)}</select></label>
     {!isAcc&&!isOther&&<F l="Repository" required value={f.repo} onChange={u('repo')} placeholder="ml-model-service"/>}</div>
     {isAcc?<>
-      <F l={resLabel} required value={ac.resource} onChange={ua('resource')} placeholder={resHint} maxLength="300"/>
-      <div className="row2"><label>Access Level<select value={ac.level} onChange={ua('level')}>{ACCESS_LEVELS.map(t=><option key={t}>{t}</option>)}</select></label>
-      <F l="Needed Until (leave blank if permanent)" type="date" min={nowLocal().slice(0,10)} value={ac.until} onChange={ua('until')}/></div>
-      <F l="Access For (leave blank if it is for you)" value={ac.for} onChange={ua('for')} placeholder="janani.n@iitmpravartak.net, baskar@iitmpravartak.net"/></>
+      {ac.type!=='Model Endpoint'&&<F l={resLabel} required value={ac.resource} onChange={ua('resource')} placeholder={resHint} maxLength="300"/>}
+      {ac.type==='Git Repository'&&<label>Access Level<select value={ac.level} onChange={ua('level')}>{ACCESS_LEVELS.map(t=><option key={t}>{t}</option>)}</select></label>}</>
     :!isOther&&<>
       {f.type==='Deployment Request'&&<F l="Branch Name" required value={f.branch} onChange={u('branch')} placeholder="release/v2.4" maxLength="200"
         pattern="[\w][\w.\/\-]*" title="Letters, numbers and _ . / - only (no spaces)"/>}
       <F l="Pull Request URL (optional)" type="url" value={f.pr_url} onChange={u('pr_url')} placeholder="https://github.com/.../pull/245"/></>}
-    {shots&&<><label>Screenshots (optional, up to 5 images, 5 MB each)
-      <input type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple onChange={addImgs}/></label>
-      {imgs.length>0&&<div className="shots">{imgs.map((x,i)=><div key={i} className="shot"><img src={x.data} alt={x.name}/>
-        <button type="button" title="Remove" onClick={()=>setImgs(imgs.filter((_,j)=>j!==i))}>×</button></div>)}</div>}</>}
+    {shots&&<ImgPicker imgs={imgs} set={setImgs} flash={flash}/>}
     <button className="btn" disabled={busy}>Submit Request</button></form></div>;
 }
 function Submitted({rid,go}){
   return <div className="card" style={{maxWidth:520,margin:'30px auto',textAlign:'center'}}><div className="ok"><Ic n="check" s={44}/></div>
-    <h2>Request Submitted Successfully!</h2><p>Request ID <b>{rid}</b><br/><br/>Status <Badge v="NEW"/></p><p style={{color:'#64748b'}}>The admin has been notified and will assign an owner.</p>
+    <h2>Request Submitted Successfully!</h2><p>Request ID <b>{rid}</b><br/><br/>Status <Badge v="NEW"/></p><p style={{color:'var(--mu)'}}>The admin has been notified and will assign an owner.</p>
     <button className="btn" onClick={()=>go('detail',rid)}>View Request</button></div>;
 }
 function TicketList({src,go,initial,requester}){
@@ -1018,19 +1263,44 @@ function Users({me,flash}){
   const load=()=>api('/users').then(setRows).catch(e=>flash(e.message));
   useEffect(()=>{load()},[]);
   const setRole=async(u,role)=>{try{await api(`/users/${u.id}/role`,'POST',{role});flash(`${u.email} is now ${ROLE_NAME[role]}`)}catch(e){flash(e.message)}load()};
-  return <div className="card"><p className="sub">Users raise tickets. ML Engineers work on tickets assigned to them. Admins assign tickets, take ownership and manage roles.
-    Assigning a ticket to someone makes them an ML Engineer automatically.</p>
-    <div className="tw"><table><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Account</th><th>Open Tickets Owned</th><th>Joined</th></tr></thead><tbody>
+  const del=async u=>{if(!confirm(`Delete ${u.name} (${u.email})?\n\nThey will no longer be able to sign in. Tickets they raised or worked on are kept. This cannot be undone.`))return;
+    try{const d=await api(`/users/${u.id}`,'DELETE');flash(d.how==='deleted'?`${u.email} was deleted.`:`${u.email} was deleted. Their name stays on the tickets they worked on.`)}catch(e){flash(e.message)}load()};
+  return <div className="card"><p className="sub">Users raise tickets. MLOps Engineers work on tickets assigned to them. Admins assign tickets, take ownership and manage roles.
+    Assigning a ticket to someone makes them an MLOps Engineer automatically.</p>
+    <div className="tw"><table><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Account</th><th>Open Tickets Owned</th><th>Joined</th><th></th></tr></thead><tbody>
     {rows.map(u=><tr key={u.id}><td>{u.name}</td><td>{u.email}</td>
-      <td>{u.id===me.id?<Badge v={u.role}/>:<select value={u.role} onChange={e=>setRole(u,e.target.value)} style={{margin:0,width:'auto',padding:'6px 10px'}}>{ROLES.map(r=><option key={r} value={r}>{ROLE_NAME[r]}</option>)}</select>}</td>
-      <td>{u.active?'Active':'Invited (not signed up yet)'}</td><td>{u.owned_open}</td><td>{u.created_at}</td></tr>)}
-    {!rows.length&&<tr><td colSpan="6" className="empty">No users.</td></tr>}</tbody></table></div></div>;
+      <td>{u.id===me.id?<Badge v={u.role} t={ROLE_NAME[u.role]}/>:<select value={u.role} onChange={e=>setRole(u,e.target.value)} style={{margin:0,width:'auto',padding:'6px 10px'}}>{ROLES.map(r=><option key={r} value={r}>{ROLE_NAME[r]}</option>)}</select>}</td>
+      <td>{u.active?'Active':'Invited (not signed up yet)'}</td><td>{u.owned_open}</td><td>{u.created_at}</td>
+      <td>{u.id!==me.id&&<button className="btn ghost sm del" onClick={()=>del(u)} title={`Delete ${u.email}`}>Delete</button>}</td></tr>)}
+    {!rows.length&&<tr><td colSpan="7" className="empty">No users.</td></tr>}</tbody></table></div></div>;
+}
+// Theme: 'light' | 'dark' | 'system' (follows the computer). Stored per browser; applied as data-theme on <html>.
+const getTheme=()=>{try{return localStorage.getItem('theme')||'light'}catch{return 'light'}};
+const applyTheme=t=>{document.documentElement.dataset.theme=(t==='dark'||(t==='system'&&matchMedia('(prefers-color-scheme: dark)').matches))?'dark':'light'};
+matchMedia('(prefers-color-scheme: dark)').addEventListener('change',()=>{if(getTheme()==='system')applyTheme('system')});
+function Settings({flash}){
+  const [theme,setTheme]=useState(getTheme());
+  const pick=t=>{setTheme(t);try{localStorage.setItem('theme',t)}catch{}applyTheme(t)};
+  const [cur,setCur]=useState(''),[p,setP]=useState(''),[c,setC]=useState(''),[busy,setBusy]=useState(false);
+  const submit=async e=>{e.preventDefault();if(p!==c)return flash('New passwords do not match');setBusy(true);
+    try{await api('/auth/change-password','POST',{current:cur,password:p});setCur('');setP('');setC('');flash('Password changed.')}catch(x){flash(x.message)}setBusy(false)};
+  return <div style={{maxWidth:560}}>
+    <div className="card"><h3>Appearance</h3><p className="sub" style={{marginBottom:14}}>Choose how the Service Desk looks on this browser.</p>
+      <div className="seg3" role="group" aria-label="Theme">{[['light','sun','Light'],['dark','moon','Dark'],['system','monitor','System']].map(([k,ic,l])=>
+        <button key={k} type="button" className={theme===k?'on':''} aria-pressed={theme===k} onClick={()=>pick(k)}><Ic n={ic} s={16}/>{l}</button>)}</div>
+      {theme==='system'&&<p className="ssub" style={{marginTop:10}}>Follows your computer's light or dark setting.</p>}</div>
+    <div className="card"><h3>Change Password</h3><p className="sub" style={{marginBottom:14}}>Use at least 8 characters. You stay logged in on this device.</p><form onSubmit={submit}>
+      <PwField l="Current Password" value={cur} onChange={e=>setCur(e.target.value)} required autoComplete="current-password"/>
+      <PwField l="New Password" value={p} onChange={e=>setP(e.target.value)} required minLength="8" autoComplete="new-password"/>
+      <PwField l="Confirm New Password" value={c} onChange={e=>setC(e.target.value)} required autoComplete="new-password"/>
+      <button className="btn" disabled={busy}>Change Password</button></form></div>
+  </div>;
 }
 function Notifications({go,refresh}){
   const [rows,setRows]=useState([]);
   useEffect(()=>{api('/notifications').then(setRows);api('/notifications/read','POST').then(refresh)},[]);
   return <div className="card">{rows.map(n=><div className="nt" key={n.id}><div className="ic"><Ic n="bell" s={18}/></div><div>
-    {n.rid&&<b><a className="l" onClick={()=>go('detail',n.rid)}>{n.rid}</a></b>} <small style={{color:'#64748b'}}>{n.created_at}</small>
+    {n.rid&&<b><a className="l" onClick={()=>go('detail',n.rid)}>{n.rid}</a></b>} <small style={{color:'var(--mu)'}}>{n.created_at}</small>
     {n.message.split('\n').map((l,i)=><div key={i}>{l}</div>)}</div></div>)}{!rows.length&&<div className="empty">No notifications.</div>}</div>;
 }
 
@@ -1051,63 +1321,121 @@ function AdminPanel({r,act}){
   const submit=e=>{e.preventDefault();const to=email.trim();
     run('/assign',{email:to,cc},d=>d.email_error?`Assigned to ${to}, but the email was NOT sent: ${d.email_error}`:`Assigned to ${to}. Email sent.`)};
   return <div><h3>Admin Actions</h3>
-    {!r.is_owner&&<div className="ownbox"><div><b>Take Ownership</b><div style={{color:'#64748b'}}>Become responsible for this ticket and resolve and close it yourself.</div></div>
+    {!r.is_owner&&<div className="ownbox"><div><b>Take Ownership</b><div style={{color:'var(--mu)'}}>Become responsible for this ticket and resolve and close it yourself.</div></div>
       <button className="btn" disabled={busy} onClick={()=>run('/take-ownership',undefined,`You now own ${r.rid}. Use Start Work when you begin.`)}><Ic n="user" s={16}/> Take Ownership</button></div>}
     <form onSubmit={submit} style={{maxWidth:560,marginTop:18}}><h4 style={{margin:'0 0 8px'}}>{r.assignee_id?'Reassign to a team member':'Assign to a team member'}</h4>
       <PersonPicker value={email} onChange={setEmail}/>
       <F l="Also notify (optional, comma-separated emails)" value={cc} onChange={e=>setCc(e.target.value)} placeholder="lead@iitmpravartak.net, qa@iitmpravartak.net"/>
       <button className="btn" disabled={busy||!email.trim()}><Ic n="send" s={16}/> Assign &amp; Send Email</button></form></div>;
 }
-function CloseForm({env,acc,act,cancel}){
-  const [c,setC]=useState({deploy_status:(acc?ACCESS_STAT:DEPLOY)[0],deployed_at:nowLocal(),notes:'',issues:'',resolution:'',deploy_url:'',version:'',env});
+// Pop-up for "Failed / Bug Fix Required": describe the bugs, attach screenshots, send to the requester's team
+function FailModal({act,flash,close}){
+  const [desc,setDesc]=useState(''),[imgs,setImgs]=useState([]),[busy,setBusy]=useState(false);
+  const submit=async e=>{e.preventDefault();setBusy(true);
+    if(await act('/fail',{description:desc,images:imgs},'Marked as Failed / Bug Fix Required. The requester has been notified.'))close(true);else setBusy(false)};
+  return <div className="modal" onClick={e=>{if(e.target===e.currentTarget)close()}}><form onSubmit={submit}>
+    <h3 style={{marginTop:0}}>Failed / Bug Fix Required</h3><p className="sub">Describe what went wrong. The requester and the team are notified so they can fix it and resubmit.</p>
+    <label>Bugs or errors encountered *<textarea rows="5" required autoFocus value={desc} onChange={e=>setDesc(e.target.value)}
+      placeholder={'Pod crashes on start-up: ModuleNotFoundError: sklearn\n/predict returns 500 for empty input'}/></label>
+    <ImgPicker imgs={imgs} set={setImgs} flash={flash}/>
+    <div className="actions"><button className="btn" style={{background:'#dc2626'}} disabled={busy}><Ic n="send" s={16}/> Submit Bug Report</button>
+      <button type="button" className="btn ghost" onClick={()=>close()}>Cancel</button></div></form></div>;
+}
+function CloseForm({env,acc,act,cancel,flash}){
+  const [fail,setFail]=useState(false);
+  const [c,setC]=useState({deploy_status:(acc?ACCESS_STAT:DEPLOY)[0],deployed_at:nowLocal(),notes:'',issues:'',resolution:'',deploy_url:'',version:'',env,vpn_user:'',vpn_password:'',api_key:'',files:[]});
   const [busy,setBusy]=useState(false);
   const u=k=>e=>setC({...c,[k]:e.target.value});
-  const submit=async e=>{e.preventDefault();setBusy(true);await act('/close',c,'Ticket closed. Everyone involved has been notified.');setBusy(false)};
+  const vpn=acc&&acc.type==='VPN'&&c.deploy_status!=='Rejected',ep=acc&&acc.type==='Model Endpoint'&&c.deploy_status!=='Rejected';
+  const addPdfs=async e=>{const files=[...e.target.files];e.target.value='';
+    if(c.files.length+files.length>5)return alert('You can attach up to 5 PDF files');
+    const big=files.find(x=>x.size>10*1024*1024);if(big)return alert(`${big.name} is larger than 10 MB`);
+    const bad=files.find(x=>!/\.pdf$/i.test(x.name));if(bad)return alert(`${bad.name} is not a PDF file`);
+    const add=await readFiles(files);setC(c=>({...c,files:[...c.files,...add]}))};
+  const submit=async e=>{e.preventDefault();setBusy(true);await act('/close',acc?{...c,deployed_at:nowLocal(),files:vpn?c.files:[],deploy_url:ep?c.deploy_url:'',api_key:'',notes:ep?'Model endpoint URL shared':c.notes}:c,'Ticket closed. Everyone involved has been notified.');setBusy(false)};
   if(acc)return <form onSubmit={submit} style={{marginTop:16}}><h3>Close Access Request</h3><p className="sub">Fields marked * are required.</p>
-    <div className="row2"><label>Result *<select value={c.deploy_status} onChange={u('deploy_status')}>{ACCESS_STAT.map(t=><option key={t}>{t}</option>)}</select></label>
-    <F l="Completed Date / Time *" type="datetime-local" required value={c.deployed_at} onChange={u('deployed_at')}/></div>
-    <label>Access Given *<textarea rows="3" required value={c.notes} onChange={u('notes')} placeholder={c.deploy_status==='Rejected'?'No access given':'User added to the ml-devs group with SSH key; read-write on the repository'}/></label>
-    <label>Issues Encountered<textarea rows="2" value={c.issues} onChange={u('issues')} placeholder="None"/></label>
-    <label>Resolution Details / Instructions for the User *<textarea rows="3" required value={c.resolution} onChange={u('resolution')} placeholder={c.deploy_status==='Rejected'?'Why the request was rejected':'How to log in, e.g. ssh user@ml-prod-01'}/></label>
-    <div className="row2"><F l="Link (optional)" type="url" value={c.deploy_url} onChange={u('deploy_url')} placeholder="https://github.com/org/ml-model-service"/>
-    <label>Environment<select value={c.env} onChange={u('env')}>{ENVS.map(t=><option key={t}>{t}</option>)}</select></label></div>
+    <label>Result *<select value={c.deploy_status} onChange={u('deploy_status')}>{ACCESS_STAT.map(t=><option key={t}>{t}</option>)}</select></label>
+    {ep?<F l="Model Endpoint URL *" type="url" required value={c.deploy_url} onChange={u('deploy_url')} placeholder="https://ml.example.com/v1/fraud-model"/>
+    :<label>{c.deploy_status==='Rejected'?'Reason for rejecting *':'Access Given *'}<textarea rows="3" required value={c.notes} onChange={u('notes')}
+      placeholder={c.deploy_status==='Rejected'?'Why the request was rejected':acc.type==='VPN'?'VPN account created on the office VPN':'Added to the ml-devs group with read-write on the repository'}/></label>}
+    {vpn&&<><div className="row2"><F l="VPN Username *" required autoComplete="off" value={c.vpn_user} onChange={u('vpn_user')} placeholder="janani.n"/>
+      <F l="VPN Password *" required autoComplete="new-password" value={c.vpn_password} onChange={u('vpn_password')} placeholder="Temporary password"/></div>
+    <label>Attach PDFs (optional, up to 5 files, 10 MB each), e.g. VPN config or setup guide
+      <input type="file" accept="application/pdf,.pdf" multiple onChange={addPdfs}/></label>
+    {c.files.length>0&&<ul className="pdfs">{c.files.map((x,i)=><li key={i}><Ic n="file" s={15}/>{x.name}
+      <button type="button" className="btn ghost sm" onClick={()=>setC({...c,files:c.files.filter((_,j)=>j!==i)})}>Remove</button></li>)}</ul>}</>}
     <div className="actions"><button className="btn g" disabled={busy}><Ic n="check" s={16}/> Close Ticket</button><button type="button" className="btn ghost" onClick={cancel}>Cancel</button></div></form>;
-  return <form onSubmit={submit} style={{marginTop:16}}><h3>Close Ticket</h3><p className="sub">Fields marked * are required.</p>
-    <div className="row2"><label>Deployment Status *<select value={c.deploy_status} onChange={u('deploy_status')}>{DEPLOY.map(t=><option key={t}>{t}</option>)}</select></label>
+  return <><form onSubmit={submit} style={{marginTop:16}}><h3>Deployment Result</h3><p className="sub">Fields marked * are required.</p>
+    <div className="row2"><label>Deployment Status *<select value={DEPLOY[0]} onChange={e=>{if(e.target.value===FAILED)setFail(true)}}>{DEPLOY.map(t=><option key={t}>{t}</option>)}</select></label>
     <F l="Deployment Date / Time *" type="datetime-local" required value={c.deployed_at} onChange={u('deployed_at')}/></div>
-    <label>Deployment Notes / Summary *<textarea rows="3" required value={c.notes} onChange={u('notes')} placeholder="What was deployed and how"/></label>
-    <label>Issues Encountered<textarea rows="2" value={c.issues} onChange={u('issues')} placeholder="None"/></label>
-    <label>Resolution Details *<textarea rows="3" required value={c.resolution} onChange={u('resolution')} placeholder="How the request was resolved"/></label>
     <F l="Deployment / Application URL *" type="url" required value={c.deploy_url} onChange={u('deploy_url')} placeholder="https://ml-service.example.com"/>
     <div className="row2"><F l="Version" value={c.version} onChange={u('version')} placeholder="v2.4.1"/>
     <label>Environment<select value={c.env} onChange={u('env')}>{ENVS.map(t=><option key={t}>{t}</option>)}</select></label></div>
-    <div className="actions"><button className="btn g" disabled={busy}><Ic n="check" s={16}/> Close Ticket</button><button type="button" className="btn ghost" onClick={cancel}>Cancel</button></div></form>;
+    <label>Deployment Notes (optional)<textarea rows="2" value={c.notes} onChange={u('notes')} placeholder="What was deployed and how"/></label>
+    <div className="actions"><button className="btn g" disabled={busy}><Ic n="check" s={16}/> Mark as Deployed &amp; Close</button><button type="button" className="btn ghost" onClick={cancel}>Cancel</button></div></form>
+    {fail&&<FailModal act={act} flash={flash} close={done=>{setFail(false);if(done)cancel()}}/>}</>;
 }
-function OwnerPanel({r,act}){
+function OwnerPanel({r,act,flash}){
   const [mode,setMode]=useState(null),[reason,setReason]=useState('');
   const hold=async e=>{e.preventDefault();if(await act('/hold',{reason},'Ticket put ON HOLD')){setMode(null);setReason('')}};
+  if(r.fix_open)return <div className="section"><h3>Work on this Ticket</h3><div className="note warn" style={{marginTop:0}}>This deployment is waiting for a bug fix.
+    Once {r.rname} (or you) fixes it and uses <b>Resubmit for Redeployment</b>, it comes back to you to redeploy.</div></div>;
   return <div className="section"><h3>Work on this Ticket</h3><p className="sub" style={{marginBottom:14}}>You own this ticket. Only you can update its status and close it.</p>
     <div className="actions">
       {r.status==='ASSIGNED'&&<button className="btn" onClick={()=>act('/start',undefined,'Ticket moved to IN PROGRESS')}><Ic n="clock" s={16}/> Start Work</button>}
       {r.status==='IN PROGRESS'&&mode!=='hold'&&<button className="btn ghost" onClick={()=>setMode('hold')}>Put On Hold</button>}
       {r.status==='ON HOLD'&&<button className="btn" onClick={()=>act('/resume',undefined,'Work resumed')}>Resume Work</button>}
-      {mode!=='close'&&<button className="btn g" onClick={()=>setMode('close')}><Ic n="check" s={16}/> Close Ticket</button>}</div>
+      {mode!=='close'&&<button className="btn g" onClick={()=>setMode('close')}><Ic n="check" s={16}/> {r.access?'Close Ticket':'Record Deployment Result'}</button>}</div>
     {mode==='hold'&&<form onSubmit={hold} style={{marginTop:16,maxWidth:560}}>
       <label>Reason for hold *<textarea rows="2" required value={reason} onChange={e=>setReason(e.target.value)} placeholder="Waiting for credentials from the requester"/></label>
       <div className="actions"><button className="btn">Put On Hold</button><button type="button" className="btn ghost" onClick={()=>setMode(null)}>Cancel</button></div></form>}
-    {mode==='close'&&<CloseForm env={r.env} acc={!!r.access} act={act} cancel={()=>setMode(null)}/>}</div>;
+    {mode==='close'&&<CloseForm env={r.env} acc={r.access} act={act} flash={flash} cancel={()=>setMode(null)}/>}</div>;
+}
+function Secret({v,show}){
+  const [see,setSee]=useState(!!show),[ok,setOk]=useState(false);
+  const copy=()=>navigator.clipboard.writeText(v).then(()=>{setOk(true);setTimeout(()=>setOk(false),1500)});
+  return <span className="secret"><code>{see?v:'••••••••'}</code>{!show&&<button type="button" className="btn ghost sm" onClick={()=>setSee(!see)}>{see?'Hide':'Show'}</button>}
+    <button type="button" className="btn ghost sm" onClick={copy}>{ok?'Copied':'Copy'}</button></span>;
+}
+function Pdfs({rid,files}){
+  const open=async x=>{try{const d=await api(`/requests/${rid}/files/${x.id}`);const b=await (await fetch(d.src)).blob();
+    const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=d.name;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),5000)}catch(e){alert(e.message)}};
+  return <ul className="pdfs">{files.map(x=><li key={x.id}><Ic n="file" s={15}/>{x.name}<button type="button" className="btn ghost sm" onClick={()=>open(x)}>Download</button></li>)}</ul>;
+}
+function BugReports({r}){
+  return <div className="section"><h3>Deployment Bugs &amp; Fixes ({r.bugs.length})</h3>{r.bugs.map((x,i)=><div key={x.id} className={'bugrep'+(x.fixed_at?' fixed':'')}>
+    <div style={{display:'flex',gap:10,alignItems:'center',flexWrap:'wrap',marginBottom:6}}><b>Attempt #{i+1} failed</b>
+      {x.fixed_at?<Badge v="CLOSED" t="FIXED & RESUBMITTED"/>:<Badge v="BUG FIX" t="BUG FIX REQUIRED"/>}</div>
+    <table className="kv"><tbody><Row k="Reported By">{x.reported_by_name} · {x.reported_at}</Row><Row k="Bugs / Errors">{x.description}</Row>
+      {x.images.length>0&&<Row k="Screenshots"><Shots rid={r.rid} images={x.images}/></Row>}
+      {x.fixed_at&&<><Row k="Fixed By">{x.fixed_by_name} · {x.fixed_at}</Row><Row k="What Was Fixed">{x.fix_notes}</Row></>}</tbody></table></div>)}</div>;
+}
+function Resubmit({r,act}){
+  const [f,setF]=useState({fix_notes:'',branch:r.branch||'',pr_url:r.pr_url||''}),[busy,setBusy]=useState(false);
+  const u=k=>e=>setF({...f,[k]:e.target.value});
+  const submit=async e=>{e.preventDefault();setBusy(true);await act('/resubmit',f,'Resubmitted. The owner has been asked to redeploy.');setBusy(false)};
+  return <form className="section" onSubmit={submit} style={{maxWidth:720}}><h3>Fix the Bugs and Resubmit</h3>
+    <p className="sub">Review the bugs and screenshots above, fix them, then resubmit. The deployment goes back to {r.aname||'the owner'} to redeploy.</p>
+    <label>What was fixed? *<textarea rows="3" required value={f.fix_notes} onChange={u('fix_notes')} placeholder="Added scikit-learn to requirements.txt and validated empty input"/></label>
+    {r.type==='Deployment Request'&&<div className="row2"><F l="Branch to Deploy" value={f.branch} onChange={u('branch')} placeholder="hotfix/v2.4.2" maxLength="200"
+      pattern="[\w][\w.\/\-]*" title="Letters, numbers and _ . / - only (no spaces)"/>
+      <F l="Pull Request URL" type="url" value={f.pr_url} onChange={u('pr_url')} placeholder="https://github.com/.../pull/246"/></div>}
+    <button className="btn g" disabled={busy}><Ic n="send" s={16}/> Resubmit for Redeployment</button></form>;
 }
 function Closure({r}){
   if(r.access)return <div className="done-box"><b>Closure Details</b><table className="kv"><tbody>
     <Row k="Closed By">{r.closed_by_name?`${r.closed_by_name} <${r.closed_by_email}>`:'-'}</Row><Row k="Closed At">{r.closed_at||'-'}</Row>
-    <Row k="Result"><b>{r.deploy_status||'-'}</b></Row><Row k="Completed At">{r.deployed_at||'-'}</Row><Row k="Access Given">{r.deploy_notes||'-'}</Row>
-    <Row k="Issues Encountered">{r.issues||'-'}</Row><Row k="Resolution / Instructions">{r.resolution||'-'}</Row><Row k="Link"><Url u={r.deploy_url}/></Row>
-    <Row k="Environment">{r.res_env||'-'}</Row></tbody></table></div>;
+    <Row k="Result"><b>{r.deploy_status||'-'}</b></Row>{r.access.type==='Model Endpoint'&&r.deploy_status!=='Rejected'?null:<Row k={r.deploy_status==='Rejected'?'Reason':'Access Given'}>{r.deploy_notes||'-'}</Row>}
+    {r.resolution?<Row k="Resolution / Instructions">{r.resolution}</Row>:null}{r.deploy_url?<Row k={r.access.type==='Model Endpoint'?'Model Endpoint URL':'Link'}><Url u={r.deploy_url}/></Row>:null}
+    {r.creds?.vpn_user&&<><Row k="VPN Username"><Secret v={r.creds.vpn_user} show/></Row><Row k="VPN Password"><Secret v={r.creds.vpn_password}/></Row></>}
+    {r.creds?.api_key&&<Row k="API Key / Token"><Secret v={r.creds.api_key}/></Row>}
+    {r.files.length>0&&<Row k="Attached PDFs"><Pdfs rid={r.rid} files={r.files}/></Row>}</tbody></table></div>;
   return <div className="done-box"><b>Closure Details</b><table className="kv"><tbody>
     <Row k="Closed By">{r.closed_by_name?`${r.closed_by_name} <${r.closed_by_email}>`:'-'}</Row><Row k="Closed At">{r.closed_at||'-'}</Row>
-    <Row k="Deployment Status">{r.deploy_status||'-'}</Row><Row k="Deployed At">{r.deployed_at||'-'}</Row><Row k="Deployment Notes">{r.deploy_notes||'-'}</Row>
-    <Row k="Issues Encountered">{r.issues||'-'}</Row><Row k="Resolution">{r.resolution||'-'}</Row><Row k="Deployment URL"><Url u={r.deploy_url}/></Row>
+    <Row k="Deployment Status"><b>{r.deploy_status||'-'}</b></Row><Row k="Deployed At">{r.deployed_at||'-'}</Row><Row k="Deployment URL"><Url u={r.deploy_url}/></Row>
     <Row k="Version">{r.version||'-'}</Row><Row k="Environment">{r.res_env||'-'}</Row>
+    {r.deploy_notes?<Row k="Deployment Notes">{r.deploy_notes}</Row>:null}{r.issues&&r.issues!=='None'?<Row k="Issues Encountered">{r.issues}</Row>:null}
+    {r.resolution?<Row k="Resolution">{r.resolution}</Row>:null}
   </tbody></table></div>;
 }
 function Shots({rid,images}){
@@ -1129,23 +1457,31 @@ function segText(r,i,cur){
   if(i===cur&&st)return [`${name(from)} for ${dur(r.now-st)} so far`,r.status==='ON HOLD'?`On hold now (${dur(r.hold_secs)} on hold in total)`:r.hold_secs>=1?`includes ${dur(r.hold_secs)} on hold`:`Waiting for ${name(b)}`];
   return ['Not reached yet',null];
 }
+// Admins can mark someone else's deployment as failed without taking ownership
+function AdminFail({act,flash}){
+  const [open,setOpen]=useState(false);
+  return <div style={{marginTop:18}}><button className="btn ghost" onClick={()=>setOpen(true)}><Ic n="send" s={16}/> Mark Failed / Bug Fix Required</button>
+    {open&&<FailModal act={act} flash={flash} close={()=>setOpen(false)}/>}</div>;
+}
 function Detail({id,me,flash,refresh}){
   const [r,setR]=useState(null),[tab,setTab]=useState('details'),[body,setBody]=useState(''),[tip,setTip]=useState(null);
   const isA=me.role==='admin';
   const load=useCallback(()=>api('/requests/'+id).then(setR).catch(e=>flash(e.message)),[id]);
   useEffect(()=>{load()},[id]);
+  // Follow changes made by other people (e.g. a failed deployment being resubmitted) without leaving the page
+  useEffect(()=>{const t=setInterval(()=>{if(!document.hidden)api('/requests/'+id).then(setR).catch(()=>{})},10000);return()=>clearInterval(t)},[id]);
   if(!r)return <div className="card">Loading…</div>;
   const act=async(p,b,ok)=>{try{const d=await api('/requests/'+id+p,'POST',b);await load();refresh();if(ok)flash(typeof ok==='function'?ok(d):ok);return true}catch(e){flash(e.message);await load();return false}};
   const active=ACTIVE.includes(r.status);
   const send=async e=>{e.preventDefault();if(await act('/comments',{body}))setBody('')};
   const cur=TRACK.indexOf(r.status==='ON HOLD'?'IN PROGRESS':r.status);
-  return <div className="card"><div style={{display:'flex',gap:12,alignItems:'center',flexWrap:'wrap'}}><h2 style={{margin:0}}>{r.rid}</h2><Badge v={r.status}/></div>
-    <h3 style={{margin:'6px 0 16px',color:'#475569',fontWeight:500}}>{r.title}</h3>
+  return <div className="card"><div style={{display:'flex',gap:12,alignItems:'center',flexWrap:'wrap'}}><h2 style={{margin:0}}>{r.rid}</h2><StatusBadge r={r}/></div>
+    <h3 style={{margin:'6px 0 16px',color:'var(--mu)',fontWeight:500}}>{r.title}</h3>
     <Tabs v={tab} set={setTab} items={[['details','Details'],['tracker','Tracker'],['conv','Conversation'],['history','Audit History']]}/>
     {tab==='details'&&<div><table className="kv"><tbody>
       <Row k="Requester">{`${r.rname} <${r.remail}>`}</Row><Row k="Type">{r.type}</Row><Row k="Priority"><Badge v={r.priority}/></Row><Row k="Environment">{r.env}</Row>
-      {r.access?<><Row k="Access To">{r.access.type}</Row><Row k={ACCESS_TYPES[r.access.type]?.[0]||'Server / System'}><b>{r.access.resource}</b></Row>
-        <Row k="Access Level">{r.access.level}</Row><Row k="Access For">{r.access.for.split(',').join(', ')}</Row><Row k="Needed Until">{r.access.until||'Permanent'}</Row></>
+      {r.access?<><Row k="Access To">{r.access.type}</Row>{r.access.resource?<Row k={ACCESS_TYPES[r.access.type]?.[0]||'Server / System'}><b>{r.access.resource}</b></Row>:null}
+        {r.access.level?<Row k="Access Level">{r.access.level}</Row>:null}{r.access.for!==r.remail?<Row k="Access For">{r.access.for.split(',').join(', ')}</Row>:null}{r.access.until?<Row k="Needed Until">{r.access.until}</Row>:null}</>
       :r.type!=='Other'&&<><Row k="Repository">{r.repo||'-'}</Row>{r.branch?<Row k="Branch"><b>{r.branch}</b></Row>:null}<Row k="Pull Request"><Url u={r.pr_url}/></Row></>}
       <Row k="Owner">{owner(r)}</Row><Row k="Ownership">{ownership(r)}{r.assigned_at?` on ${r.assigned_at}`:''}</Row>
       {r.cc?<Row k="Also Notified">{r.cc.split(',').join(', ')}</Row>:null}
@@ -1153,15 +1489,18 @@ function Detail({id,me,flash,refresh}){
       <Row k="Created">{r.created_at}</Row><Row k="Last Updated">{r.updated_at}</Row><Row k="Description">{r.description}</Row>
       {r.images.length>0&&<Row k="Screenshots"><Shots rid={r.rid} images={r.images}/></Row>}</tbody></table>
       {r.status==='CLOSED'&&<Closure r={r}/>}
-      {r.is_owner&&active&&<OwnerPanel r={r} act={act}/>}
+      {r.bugs.length>0&&<BugReports r={r}/>}
+      {r.fix_open&&(isA||r.is_owner||me.id===r.requester_id)&&<Resubmit key={r.bugs.length} r={r} act={act}/>}
+      {r.is_owner&&active&&<OwnerPanel r={r} act={act} flash={flash}/>}
       {!r.is_owner&&active&&<div className="note"><b>{r.aname}</b> owns this ticket and is responsible for resolving and closing it.{isA?' Use Take Ownership below to work on it yourself.':''}</div>}
-      {isA&&r.status!=='CLOSED'&&<div className="section"><AdminPanel key={r.assignee_id||0} r={r} act={act}/></div>}</div>}
+      {isA&&r.status!=='CLOSED'&&<div className="section"><AdminPanel key={r.assignee_id||0} r={r} act={act}/>
+        {!r.access&&!r.fix_open&&!r.is_owner&&r.assignee_id&&<AdminFail act={act} flash={flash}/>}</div>}</div>}
     {tab==='tracker'&&<div><div className="track">{TRACK.map((s,i)=><div key={s} className={'step '+(i<=cur?'done ':'')+(i===cur?'cur':'')}><div className="dot">{i<=cur?<Ic n="check" s={16}/>:i+1}</div>
-      <b>{i===cur&&r.status==='ON HOLD'?'ON HOLD':s}</b>{i===cur&&r.status==='ON HOLD'?DESC['ON HOLD']:DESC[s]}<br/>{i<=cur?r.ts[s]||'':''}
+      <b>{i===cur&&r.status==='ON HOLD'?(r.fix_open?'BUG FIX REQUIRED':'ON HOLD'):s}</b>{i===cur&&r.status==='ON HOLD'?(r.fix_open?'Waiting for the fix':DESC['ON HOLD']):DESC[s]}<br/>{i<=cur?r.ts[s]||'':''}
         {i<TRACK.length-1&&(([a,b])=><span className={'seg'+(i<cur?' done':i===cur&&r.status!=='CLOSED'?' now':'')+(tip===i?' open':'')} tabIndex="0"
           onClick={()=>setTip(tip===i?null:i)} onBlur={()=>setTip(null)}><span className="tip">{a}{b&&<small>{b}</small>}</span></span>)(segText(r,i,cur))}</div>)}</div>
       {r.tse?.NEW&&<p><b>Total time:</b> {dur((r.tse.CLOSED||r.now)-r.tse.NEW)}{r.tse.CLOSED?' (New → Closed)':' so far'}{r.hold_secs>=1?`, including ${dur(r.hold_secs)} on hold`:''}
-        <span style={{color:'#64748b'}}> · Hover or tap a line to see the time between steps</span></p>}
+        <span style={{color:'var(--mu)'}}> · Hover or tap a line to see the time between steps</span></p>}
       <p><b>Current Status:</b> <Badge v={r.status}/> &nbsp; <b>Owner:</b> {owner(r)}</p>{r.status==='CLOSED'&&(r.access?<p><b>Result:</b> {r.deploy_status}</p>:<p><b>Deployment URL:</b> <Url u={r.deploy_url}/></p>)}</div>}
     {tab==='conv'&&<div><div className="chat">{r.comments.map((m,i)=><div key={i} className={'msg '+(m.author_id===me.id?'me':'')}><small><b>{m.name}</b> ({ROLE_NAME[m.role]}) · {m.created_at}</small>{m.body}</div>)}
       {!r.comments.length&&<div className="empty">No messages yet.</div>}</div>
@@ -1189,15 +1528,16 @@ function Shell({me,page,go,logout,children}){
     ['notifs','bell','Notifications']];
   const home=isA?'queue':me.role==='engineer'?'assigned':'my';
   const active=(page.n==='detail'||page.n==='submitted')?home:page.n;
-  const titles={dashboard:isA?'Admin Dashboard':'Dashboard',raise:'Raise Request',my:'My Requests',assigned:isA?'My Owned Tickets':'Assigned to Me',queue:'All Tickets',users:'Users & Roles',notifs:'Notifications',detail:'Ticket '+(page.a||''),submitted:'Request Submitted'};
+  const titles={dashboard:isA?'Admin Dashboard':'Dashboard',raise:'Raise Request',my:'My Requests',assigned:isA?'My Owned Tickets':'Assigned to Me',queue:'All Tickets',users:'Users & Roles',notifs:'Notifications',settings:'Settings',detail:'Ticket '+(page.a||''),submitted:'Request Submitted'};
   const ini=me.name.split(' ').map(x=>x[0]).join('').slice(0,2).toUpperCase();
   const nav2=k=>{setOpen(false);go(k)};
   return <div className="app"><div className={'shade '+(open?'on':'')} onClick={()=>setOpen(false)}/>
     <aside className={'side '+(open?'open':'')}>
-      <div className="brand"><div className="logo">⚙</div><div><b>MLOps</b><small>Service Desk</small></div></div>
+      <div className="brand" role="link" tabIndex="0" title="Go to Dashboard" onClick={()=>nav2('dashboard')} onKeyDown={e=>{if(e.key==='Enter')nav2('dashboard')}}><img className="logo" src="/logo.png" alt="CHAI"/><div><b>MLOps</b><small>Service Desk</small></div></div>
       <div className="menu">{nav.map(([k,ic,l])=><div key={k} className={'nl '+(active===k?'on':'')} onClick={()=>nav2(k)}><Ic n={ic}/>{l}
         {k==='notifs'&&me.unread>0&&<span className="cnt">{me.unread}</span>}</div>)}</div>
       <div className="usr"><div className="av">{ini}</div><div className="i"><b>{me.name}</b><small>{ROLE_NAME[me.role]}</small></div></div>
+      <div className={'nl set '+(active==='settings'?'on':'')} onClick={()=>nav2('settings')}><Ic n="gear"/>Settings</div>
       <div className="nl out" onClick={logout}><Ic n="out"/>Logout</div>
     </aside>
     <div className="main"><div className="top"><button className="burger" onClick={()=>setOpen(true)}><Ic n="menu"/></button><h1>{titles[page.n]||''}</h1>
@@ -1249,6 +1589,7 @@ function App(){
     else if(n==='queue'&&isA)c=<TicketList key={'queue'+page.a} src="/queue" initial={page.a} go={go} requester/>;
     else if(n==='users'&&isA)c=<Users me={me} flash={flash}/>;
     else if(n==='notifs')c=<Notifications go={go} refresh={loadMe}/>;
+    else if(n==='settings')c=<Settings flash={flash}/>;
     else if(n==='detail')c=<Detail key={page.a} id={page.a} me={me} flash={flash} refresh={loadMe}/>;
     else c=dash;
     body=<Shell me={me} page={page} go={go} logout={logout}>{c}</Shell>;
@@ -1266,6 +1607,11 @@ PAGE = PAGE.replace("__BUILD__", BUILD)
 @app.get("/", response_class=HTMLResponse)
 def index(): return HTMLResponse(PAGE, headers={"Cache-Control": "no-cache"})  # browsers pick up a new version after a restart
 
+LOGO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chai_logo.png")
+
+@app.get("/logo.png", include_in_schema=False)
+def logo(): return FileResponse(LOGO, media_type="image/png", headers={"Cache-Control": "no-cache"})
+
 def import_sqlite(path):
     # One-time copy of user accounts (with their password hashes and roles) from the old SQLite database
     import sqlite3
@@ -1282,6 +1628,9 @@ if __name__ == "__main__":
     if len(args) == 2 and args[0] == "--test-email":  # checks the SMTP settings without starting the server
         err = mail(args[1], "MLOps Service Desk test email", "If you can read this, email notifications are working.")
         print("\nTest email sent." if not err else f"\nTest email NOT sent: {err}"); sys.exit(1 if err else 0)
+    if args == ["--ensure-admins"]:  # repair: apply ADMIN_EMAILS to the database now, then list the admins
+        admins = start_db()
+        print("\nAdmins now:", ", ".join(admins) or "NONE (set ADMIN_EMAILS in .env)"); pool.close(); sys.exit(0 if admins else 1)
     if len(args) == 2 and args[0] == "--import-sqlite":
         start_db(); import_sqlite(args[1]); pool.close(); sys.exit(0)
     import socket
@@ -1292,5 +1641,5 @@ if __name__ == "__main__":
                   f"  Get-NetTCPConnection -LocalPort {PORT} -State Listen | ForEach-Object {{ Stop-Process -Id $_.OwningProcess -Force }}\n")
             sys.exit(1)
     # Uvicorn prints http://0.0.0.0:PORT, which browsers can't open; show the addresses people should use
-    print(f"\n  Open on this PC:        http://127.0.0.1:{PORT}" + (f"\n  Open from other PCs:    {APP_URL}" if HOST != "127.0.0.1" else "") + "\n", flush=True)
+    print(f"\n  Open on this PC:        http://127.0.0.:{PORT}" + (f"\n  Open from other PCs:    {APP_URL}" if HOST != "127.0.0.1" else "") + "\n", flush=True)
     uvicorn.run(app, host=HOST, port=PORT)

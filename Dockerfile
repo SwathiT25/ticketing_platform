@@ -16,7 +16,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY mlops_service_desk.py .
+COPY mlops_service_desk.py chai_logo.png ./
 
 # Run as a normal user, not root
 RUN useradd --system --uid 10001 servicedesk

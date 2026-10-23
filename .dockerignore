@@ -1,9 +1,10 @@
-# Only requirements.txt and mlops_service_desk.py are needed in the image.
+﻿# Only requirements.txt, mlops_service_desk.py and chai_logo.png are needed in the image.
 # Secrets and data must never be baked into it.
 .env
 *.sql
 *.db
 *.backup
+*.dump
 backups/
 .git/
 .gitignore

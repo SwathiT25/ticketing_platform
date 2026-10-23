@@ -29,6 +29,7 @@ services:
     image: mlops-servicedesk:latest
     container_name: ticketing-platform-app
     restart: unless-stopped
+    stop_grace_period: 30s      # lets queued notification emails finish sending during an update
     env_file: .env
     environment:
       # Inside Docker the app reaches PostgreSQL by its service name, not the host port

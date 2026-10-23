@@ -1,4 +1,4 @@
-# Python
+﻿# Python
 __pycache__/
 *.py[cod]
 .venv/
@@ -22,3 +22,4 @@ Thumbs.db
 # Database backups (contain user data)
 backups/
 *.backup
+*.dump

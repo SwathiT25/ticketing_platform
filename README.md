@@ -1,6 +1,6 @@
 # MLOps Service Desk
 
-A ticketing platform for MLOps requests: deployments, access requests, bug fixes and general requests. Users raise tickets, an admin assigns each one to an ML Engineer (or takes ownership), and the owner works the ticket through to closure. Every step is emailed to the people involved and recorded in an audit trail.
+A ticketing platform for MLOps requests: deployments, access requests, bug fixes and general requests. Users raise tickets, an admin assigns each one to an MLOps Engineer (or takes ownership), and the owner works the ticket through to closure. Every step is emailed to the people involved and recorded in an audit trail.
 
 | | |
 |---|---|
@@ -33,13 +33,15 @@ Then open `http://<server-ip>:8000`. The full steps are in [Deployment with Dock
 4. [Deployment with Docker (recommended)](#deployment-with-docker-recommended)
 5. [Deployment without Docker](#deployment-without-docker)
 6. [Configuration reference (.env)](#configuration-reference-env)
-7. [Run it as a service (without Docker)](#run-it-as-a-service-without-docker)
-8. [Updating to a new version](#updating-to-a-new-version)
-9. [Backup and restore](#backup-and-restore)
-10. [Security checklist](#security-checklist)
-11. [Troubleshooting](#troubleshooting)
-12. [Features](#features)
-13. [Database tables](#database-tables)
+7. [Admin accounts](#admin-accounts)
+8. [Run it as a service (without Docker)](#run-it-as-a-service-without-docker)
+9. [Updating, and rolling back](#updating-and-rolling-back)
+10. [Backup and restore](#backup-and-restore)
+11. [Logs](#logs)
+12. [Security checklist](#security-checklist)
+13. [Troubleshooting](#troubleshooting)
+14. [Features](#features)
+15. [Database tables](#database-tables)
 
 ---
 
@@ -134,7 +136,7 @@ docker compose ps           # both containers should show "healthy" after ~30 se
 docker compose logs -f app  # live app log; Ctrl+C stops watching, the app keeps running
 ```
 
-The first start creates all tables and the admin account from `ADMIN_EMAIL` / `ADMIN_PASSWORD`.
+Every start creates or upgrades the tables and makes each address in `ADMIN_EMAILS` an admin (see [Admin accounts](#admin-accounts)). Check the log for `Created admin account` or `Promoted ... to admin`.
 
 ### 4. Check email, open the firewall, verify
 
@@ -188,7 +190,7 @@ Edit `.env` and set at least:
 - `SECRET_KEY`: generate one with `python3 -c "import secrets; print(secrets.token_hex(32))"`.
 - `POSTGRES_PASSWORD`, and the same password inside `DATABASE_URL` (not needed with Docker). Use letters and numbers only.
 - `APP_URL`: the address users will open, for example `http://10.10.182.220:8000`. Links in emails use it.
-- `ADMIN_EMAIL` and `ADMIN_PASSWORD`: the first admin account.
+- `ADMIN_EMAILS`: every address that must be an admin, comma-separated. `ADMIN_PASSWORD` (optional) is the starting password for admin accounts that don't exist yet. See [Admin accounts](#admin-accounts).
 - `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM`: the mailbox that sends notifications.
 - `TEAM_EMAILS`: the people the admin assigns tickets to.
 
@@ -225,7 +227,7 @@ It prints `Test email sent.` on success, or the SMTP error.
 python mlops_service_desk.py
 ```
 
-The first start creates all tables and the admin account from `ADMIN_EMAIL` / `ADMIN_PASSWORD`. You should see `Uvicorn running on http://0.0.0.0:8000`.
+Every start creates or upgrades the tables and applies `ADMIN_EMAILS`. You should see the links to open, then `Uvicorn running on ...`.
 
 ### 7. Open the firewall port
 
@@ -260,13 +262,85 @@ The app reads `.env` from its own folder. Real environment variables override `.
 | `SECRET_KEY` | ✅ | (insecure default) | Signs login tokens. Long random string. Changing it logs everyone out |
 | `DATABASE_URL` | ✅ without Docker | | `postgresql://USER:PASSWORD@127.0.0.1:5434/DB`. Docker builds it automatically |
 | `POSTGRES_DB` / `POSTGRES_USER` / `POSTGRES_PASSWORD` | ✅ | | Create the database. Without Docker they must match `DATABASE_URL`. Password: letters and numbers only |
-| `ADMIN_EMAIL` / `ADMIN_PASSWORD` | | `admin@example.com` / `Admin@123` | First admin, created only when the database has no admin yet |
+| `ADMIN_EMAILS` | ✅ | (none) | Comma-separated admin addresses, applied on every start. `ADMIN_EMAIL` (one address) still works too |
+| `ADMIN_PASSWORD` | | (empty) | Starting password only for admin accounts that don't exist yet. Never changes an existing password |
 | `SMTP_HOST` / `SMTP_PORT` | | | Mail server, e.g. `smtp.office365.com` / `587` (STARTTLS). Port `465` uses SSL |
 | `SMTP_USER` / `SMTP_PASS` | | | Mailbox login. Microsoft 365 and Gmail need an **app password** |
 | `SMTP_FROM` | | `SMTP_USER` | Sender address shown on emails |
 | `TEAM_EMAILS` | | | Comma-separated emails shown in the admin's **Assign** dropdown |
 
 Without SMTP settings, emails are printed to the console and the sign-up code is shown on screen. That's fine for local testing, but not for production.
+
+---
+
+## Admin accounts
+
+### How admins are set up
+
+On **every start** (and whenever `--ensure-admins` runs) the app reads `ADMIN_EMAILS` and makes sure each address is an admin:
+
+| The address in `ADMIN_EMAILS`… | What happens |
+|---|---|
+| already has an account (User or MLOps Engineer) | It is **promoted to admin**. Its password is not touched |
+| already is an admin | Nothing |
+| has no account, and `ADMIN_PASSWORD` is set | An admin account is created with `ADMIN_PASSWORD` as its starting password |
+| has no account, and `ADMIN_PASSWORD` is empty | An admin account is created **without a password**. The owner activates it with *Create account*, using a code emailed to that address |
+
+- **Admins not in the list:** left alone. Removing an address from `ADMIN_EMAILS` doesn't demote it; use *Users & Roles* for that.
+- **Nothing hard-coded:** nobody becomes an admin by default. People who sign up are always Users.
+- **Missing admins:** if the database ends up with no admin at all, the log says so and explains how to fix it.
+- **Roles apply at once:** a role change takes effect on the user's next click, with no re-login. The role is read from the database on every request.
+- **Every change is recorded:** each promotion or creation is written to the `audit_log` table.
+
+### Production setup for this project
+
+In the server's `.env`:
+
+```ini
+ADMIN_EMAILS=chaigrafana_alerts@iitmpravartak.net,admin@example.com
+ADMIN_PASSWORD=Admin@123
+```
+
+Then, straight after deploying:
+
+1. Log in as `admin@example.com` / `Admin@123`, open **Settings → Change Password** (bottom of the menu), and set a strong password. `admin@example.com` has no real mailbox, so *Forgot password?* can't work for it; Change Password is the only way.
+2. Log in as `chaigrafana_alerts@iitmpravartak.net` with its existing password and change it the same way. **In the 15 Oct backups this account's password is still `Admin@123`.**
+3. Remove the `ADMIN_PASSWORD` line from `.env` (or leave it empty) and restart: `docker compose up -d`.
+
+Until an admin's password is changed, every start logs `Admin ... still uses the default password Admin@123`.
+
+### Repair admin roles
+
+Run this when someone who should be an admin shows up as a User. It applies `ADMIN_EMAILS` straight away and lists the admins, without restarting the app. It's safe to run any number of times.
+
+```bash
+# Docker (Linux or Windows PowerShell)
+docker compose exec app python mlops_service_desk.py --ensure-admins
+
+# Without Docker
+python mlops_service_desk.py --ensure-admins
+```
+
+Expected output ends with `Admins now: chaigrafana_alerts@iitmpravartak.net, admin@example.com`. If an address you expect is missing, check its spelling in `.env`, then run `docker compose up -d` so the container picks up the edited `.env`, and run the command again.
+
+Check the roles directly in the database:
+
+```bash
+docker exec servicedesk-postgres psql -U <POSTGRES_USER> -d <POSTGRES_DB> -c "select email, role, pw_hash is not null as can_log_in from users where role='admin';"
+```
+
+**Emergency, if the app can't run at all:** promote an existing account by hand. This changes only the role; the password stays the same.
+
+```bash
+docker exec servicedesk-postgres psql -U <POSTGRES_USER> -d <POSTGRES_DB> -c "update users set role='admin', updated_at=now() where email='chaigrafana_alerts@iitmpravartak.net';"
+```
+
+**Locked out of every admin account:** add an address you can receive mail at to `ADMIN_EMAILS`, run the repair command, then use *Forgot password?* (or *Create account* if it's new) with that address.
+
+### Verify admin access
+
+1. Log in as each admin. The menu shows **All Tickets** and **Users & Roles**.
+2. Log in as a normal User. Those menu items are absent. Hiding them isn't the protection: the server checks the role on every admin request and answers `403 Admin only` to anyone else.
 
 ---
 
@@ -327,44 +401,130 @@ server {
 
 ---
 
-## Updating to a new version
+## Updating, and rolling back
+
+### Update (Docker)
 
 ```bash
 cd ticketing_platform
+# 1. Back up the database (see Backup and restore)
+# 2. Keep the current image so you can go back to it
+docker image tag mlops-servicedesk:latest mlops-servicedesk:rollback
+git rev-parse --short HEAD          # note this commit id
+# 3. Get the new code and rebuild. The database container and its volume are kept.
 git pull
-
-# With Docker: rebuild and restart the app (the database and its data are kept)
 docker compose up -d --build
+docker compose ps                   # both "healthy"
+docker compose logs --tail 30 app   # look for "Connected to PostgreSQL" and no errors
+```
 
-# Without Docker:
+- **Database:** changes are applied automatically on startup. They only add tables or columns, so no manual migrations are needed and nothing is deleted.
+- **Users with the app open:** they see an *"A new version is available. Reload"* banner.
+- **Never run `docker compose down -v`:** the `-v` deletes the database volume.
+
+### Roll back (Docker)
+
+```bash
+docker image tag mlops-servicedesk:rollback mlops-servicedesk:latest
+docker compose up -d --no-build app
+git checkout <commit id noted above>     # keeps the files in step with the running image
+```
+
+The older version runs fine against the newer database, because updates only ever add columns. Restore the backup only if the data itself must go back to how it was before the update.
+
+### Update without Docker
+
+```bash
+git pull
 pip install -r requirements.txt     # inside the virtual environment
 sudo systemctl restart servicedesk  # or stop and start the process
 ```
 
-- **Database:** changes are applied automatically on startup (`create table if not exists`, `alter table ... add column if not exists`). No manual migrations are needed.
-- **Users with the app open:** they see a *"A new version is available. Reload"* banner.
-- **Back up first.** Take a [backup](#backup-and-restore) before upgrading.
+To roll back, `git checkout <previous commit>` and restart.
 
 ---
 
 ## Backup and restore
 
-All data (users, tickets, history, screenshots) is in PostgreSQL. Replace `servicedesk` below with your `POSTGRES_USER` / `POSTGRES_DB` if they differ.
+All data (users, tickets, history, comments, screenshots, notifications, audit log) is in PostgreSQL. Below, replace `servicedesk` with your `POSTGRES_USER` and `POSTGRES_DB`. These commands work the same in Linux and Windows PowerShell, because they copy files with `docker cp` instead of `<` / `>` redirection, which PowerShell mangles.
+
+### Back up
 
 ```bash
-# Backup to a file
-docker exec servicedesk-postgres pg_dump -U servicedesk -d servicedesk > backup-$(date +%F).sql
+docker exec servicedesk-postgres pg_dump -U servicedesk -d servicedesk -Fc -f /tmp/backup.dump
+docker cp servicedesk-postgres:/tmp/backup.dump ./servicedesk-backup.dump
+```
 
-# Restore: stop the app (docker compose stop app), empty the database, load the backup, start the app
+- **Format:** `-Fc` is PostgreSQL's custom format: compressed, and restored with `pg_restore`.
+- **The file:** holds user emails and password hashes. Store it privately. Git and Docker already ignore `*.sql`, `*.dump`, `*.backup` and `backups/`.
+- **Schedule:** run this daily (cron or Task Scheduler) with a dated file name, and copy the files off the server.
+
+### Validate a backup before using it
+
+Always restore into a **scratch** database first. This never touches the live data.
+
+```bash
+docker exec servicedesk-postgres psql -U servicedesk -d postgres -c "create database restore_check;"
+
+# custom format (file starts with PGDMP, e.g. backups/servicedesk.backup)
+docker cp ./servicedesk-backup.dump servicedesk-postgres:/tmp/restore.dump
+docker exec servicedesk-postgres pg_restore -U servicedesk -d restore_check --no-owner --no-privileges --exit-on-error /tmp/restore.dump
+
+# plain SQL format (file starts with "-- PostgreSQL database dump", e.g. servicedesk_dump_2026-10-15.sql)
+docker cp ./servicedesk_dump_2026-10-15.sql servicedesk-postgres:/tmp/restore.sql
+docker exec servicedesk-postgres psql -U servicedesk -d restore_check -v ON_ERROR_STOP=1 -q -f /tmp/restore.sql
+
+# look inside, then drop the scratch database
+docker exec servicedesk-postgres psql -U servicedesk -d restore_check -c "select email, role from users order by role, email;" -c "select count(*) as tickets from tickets;"
+docker exec servicedesk-postgres psql -U servicedesk -d postgres -c "drop database restore_check;"
+```
+
+Both backups from 15 Oct 2026 (`servicedesk_dump_2026-10-15.sql` and `backups/servicedesk.backup`) were checked this way:
+
+- **Contents:** full schema and data, with 4 users and 0 tickets.
+- **Admin:** `chaigrafana_alerts@iitmpravartak.net` is the admin.
+- **Compatibility:** they lack the newer `branch` column, which the app adds by itself on startup.
+
+### Restore over the live database
+
+Only do this to replace the live data on purpose. Take a fresh backup first.
+
+```bash
+docker compose stop app
 docker exec servicedesk-postgres psql -U servicedesk -d postgres -c "drop database servicedesk;" -c "create database servicedesk;"
-docker exec -i servicedesk-postgres psql -U servicedesk -d servicedesk < backup-2026-10-15.sql
-docker compose start app
+docker cp ./servicedesk-backup.dump servicedesk-postgres:/tmp/restore.dump
+docker exec servicedesk-postgres pg_restore -U servicedesk -d servicedesk --no-owner --no-privileges --exit-on-error /tmp/restore.dump
+# (plain SQL instead: docker cp the .sql file, then psql -v ON_ERROR_STOP=1 -f /tmp/restore.sql as above)
+docker compose start app        # upgrades the schema and applies ADMIN_EMAILS on start
+```
 
-# Open a SQL prompt
+Changing a role never needs a restore. Use the [repair command](#repair-admin-roles) instead.
+
+### SQL prompt
+
+```bash
 docker exec -it servicedesk-postgres psql -U servicedesk -d servicedesk
 ```
 
-Schedule the backup command daily (cron or Task Scheduler) and copy the files off the server.
+---
+
+## Logs
+
+| What | Command |
+|---|---|
+| App, live | `docker compose logs -f app` |
+| App, last 100 lines | `docker compose logs --tail 100 app` |
+| Database | `docker compose logs --tail 100 postgres` |
+| Health of both | `docker compose ps` |
+| App without Docker | the terminal it runs in, or `sudo journalctl -u servicedesk -f` |
+
+Useful lines to look for:
+
+- `Connected to PostgreSQL at postgresql://user:***@postgres:5432/...`. The password is always masked.
+- `Created admin account ...` or `Promoted ... to admin`.
+- `There is no admin account`.
+- `still uses the default password`.
+- `--- EMAIL to ...` for each email sent, and `Mail failed:` with the SMTP error when sending doesn't work.
 
 ---
 
@@ -372,7 +532,8 @@ Schedule the backup command daily (cron or Task Scheduler) and copy the files of
 
 - [ ] `.env` is not in Git (`.gitignore` covers it), and only the service account can read it.
 - [ ] `SECRET_KEY` is a long random value, not the example.
-- [ ] The default admin password `Admin@123` has been changed.
+- [ ] Every admin has changed away from `Admin@123` (the startup log no longer warns), and `ADMIN_PASSWORD` is cleared in `.env`.
+- [ ] `ADMIN_EMAILS` lists exactly the people who should be admins.
 - [ ] `POSTGRES_PASSWORD` is strong. PostgreSQL stays bound to `127.0.0.1` (as in `docker-compose.yml`).
 - [ ] The SMTP password is an app password, not the mailbox's main password.
 - [ ] Port 8000 is open only to the office network, or HTTPS is set up through a reverse proxy.
@@ -411,7 +572,7 @@ The app logs to `docker compose logs -f app` with Docker, or to the console (`jo
 
 ### Roles
 
-| Action | User | ML Engineer | Admin |
+| Action | User | MLOps Engineer | Admin |
 |---|:-:|:-:|:-:|
 | Raise tickets, see and comment on their own tickets | ✅ | ✅ | |
 | See tickets assigned to them | | ✅ | ✅ |
@@ -421,7 +582,7 @@ The app logs to `docker compose logs -f app` with Docker, or to the console (`jo
 | Change user roles | | | ✅ |
 
 - New sign-ups are **Users**.
-- Assigning a ticket to someone makes them an **ML Engineer**. If they have no account yet, an invited account is created and they activate it with *Create account*.
+- Assigning a ticket to someone makes them an **MLOps Engineer**. If they have no account yet, an invited account is created and they activate it with *Create account*.
 - Admins can't change their own role, and someone who owns open tickets can't be demoted to User.
 
 ### Request types
@@ -450,6 +611,13 @@ NEW ──assign / take ownership──▶ ASSIGNED ──Start Work──▶ IN
 - **Emails:** sent at every step to the requester, the owner, admins, anyone in *Also notify*, and the people an access request is for.
 - **In-app:** notifications refresh every 5 seconds with an optional chime.
 - **Dashboards:** each role has its own, refreshed every 10 seconds.
+
+### Settings
+
+**Settings** sits at the bottom of the menu, above Logout. It has two parts:
+
+- **Appearance:** Light, Dark or System (follows the computer's setting). The choice is remembered per browser.
+- **Change Password:** current password, then the new one twice.
 
 ### Command-line tools
 
